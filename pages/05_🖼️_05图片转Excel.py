@@ -1,4 +1,4 @@
-# pages/04_🖼️_图片转Excel.py
+# pages/05_🖼️_05图片转Excel.py
 import os
 import io
 import streamlit as st
@@ -19,10 +19,10 @@ MODEL_VISION_JUDGE = os.getenv("MODEL_VISION_Judge", "").strip()
 
 st.set_page_config(page_title="图片转Excel", page_icon="🖼️", layout="wide")
 st.title("🖼️ 智能 OCR：图片提取转 Excel")
-st.markdown("上传含有表格的截图或照片，支持**多选**和**Ctrl+V直接粘贴**，AI 将自动提取并允许您下载为标准 Excel 文件。")
+st.markdown("上传含有表格的截图或照片，支持**多选**和**Ctrl+V直接粘贴**。系统将**为每一张图片独立提取**并提供单独的 Excel 下载。")
 
 # ==========================================
-# ⚙️ 新增：提取模式选择 (简单 vs 专业)
+# ⚙️ 提取模式选择 (简单 vs 专业)
 # ==========================================
 mode = st.radio(
     "⚙️ 请选择提取模式",
@@ -33,7 +33,6 @@ mode = st.radio(
     horizontal=False
 )
 
-# 根据用户选择动态组装模型列表
 if "简单模式" in mode:
     active_extract_models = [MODEL_VISION]
     active_reviewer_model = None
@@ -51,7 +50,6 @@ else:
 
 st.divider()
 
-# 左侧上传，右侧预览
 col1, col2 = st.columns([1, 1])
 
 with col1:
@@ -71,31 +69,24 @@ with col2:
 
 st.divider()
 
-# 执行逻辑
 if uploaded_files:
-    if st.button("🚀 开始批量提取表格数据", type="primary", use_container_width=True):
+    if st.button("🚀 开始精准提取表格数据", type="primary", use_container_width=True):
         if not API_KEY:
             st.error("缺失 API KEY 配置，请检查根目录的 .env 文件！")
             st.stop()
             
-        all_dfs = []
-        all_mds = []
+        processed_data = []
+        failed_files = []
         total_files = len(uploaded_files)
         
-        # 使用 st.status 创建一个可折叠的“执行状态面板”
-        with st.status("🤖 视觉模型正在扫描并提取数据...", expanded=True) as status:
+        with st.status("🤖 视觉模型正在逐一扫描并提取数据...", expanded=True) as status:
             progress_bar = st.progress(0)
-            
-            # 用于记录失败的文件
-            failed_files = []
             
             for idx, uploaded_file in enumerate(uploaded_files):
                 st.write(f"🔄 正在处理第 {idx+1}/{total_files} 张图片: `{uploaded_file.name}` ...")
-                
-                # 👇 核心修改：将 try-except 放进循环内部，单张失败不导致整体崩溃
                 try:
-                    # 传入用户动态选择的 active_extract_models
-                    df, raw_md = process_image_to_df(
+                    # 👇 接收扩充后的3个返回值 (增加 debug_info)
+                    df, raw_md, debug_info = process_image_to_df(
                         image_bytes=uploaded_file.getvalue(), 
                         api_key=API_KEY, 
                         api_base=API_BASE, 
@@ -103,47 +94,74 @@ if uploaded_files:
                         reviewer_model=active_reviewer_model
                     )
                     
-                    all_dfs.append(df)
-                    all_mds.append(f"### {uploaded_file.name} 提取结果 ###\n{raw_md}")
+                    processed_data.append({
+                        "filename": uploaded_file.name,
+                        "df": df,
+                        "md": raw_md,
+                        "debug_info": debug_info # 保存调试字典
+                    })
                     st.write(f"✅ `{uploaded_file.name}` 处理完成！")
                     
                 except Exception as e:
-                    # 捕获失败，记录日志，但让程序继续处理下一张图片
                     st.error(f"❌ `{uploaded_file.name}` 提取失败: {e}")
                     failed_files.append(uploaded_file.name)
                 
-                # 无论成功失败，都推进进度条
                 progress_bar.progress((idx + 1) / total_files)
             
-            # 循环结束后，根据结果更新顶部状态面板
             if failed_files:
                 if len(failed_files) == total_files:
                     status.update(label="❌ 全部图片提取失败，请检查网络或模型状态", state="error", expanded=True)
                 else:
-                    status.update(label=f"⚠️ 部分提取完成 (成功 {len(all_dfs)} 张，失败 {len(failed_files)} 张)", state="complete", expanded=True)
+                    status.update(label=f"⚠️ 部分提取完成 (成功 {len(processed_data)} 张，失败 {len(failed_files)} 张)", state="complete", expanded=True)
             else:
                 status.update(label="🎉 全部图片提取成功！", state="complete", expanded=False)
         
-        # 数据展示与下载区
-        if all_dfs:
-            st.success("✅ 数据提取与整合完毕！预览如下：")
+        # ==========================================
+        # 👇 数据展示与下载区
+        # ==========================================
+        if processed_data:
+            st.success("✅ 数据提取完毕！")
             
-            final_df = pd.concat(all_dfs, ignore_index=True)
-            st.dataframe(final_df, use_container_width=True)
-            
-            excel_buffer = io.BytesIO()
-            final_df.to_excel(excel_buffer, index=False)
-            excel_data = excel_buffer.getvalue()
-            
-            col_btn, _ = st.columns([1, 3])
-            with col_btn:
-                st.download_button(
-                    label="📥 一键下载合并后的 Excel",
-                    data=excel_data,
-                    file_name="批量表格提取结果.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    type="primary"
-                )
+            for idx, item in enumerate(processed_data):
+                file_basename = os.path.splitext(item['filename'])[0]
                 
-            with st.expander("🛠️ 查看大模型原始 Markdown 返回值 (含降级提示)"):
-                st.markdown("\n\n---\n\n".join(all_mds))
+                with st.expander(f"📊 提取结果 [{idx+1}]: {item['filename']}", expanded=True):
+                    # 1. 展示最终 Excel 数据
+                    st.dataframe(item['df'], use_container_width=True)
+                    
+                    # 2. 生成下载流
+                    excel_buffer = io.BytesIO()
+                    item['df'].to_excel(excel_buffer, index=False)
+                    excel_data = excel_buffer.getvalue()
+                    
+                    st.download_button(
+                        label="📥 下载本表 Excel",
+                        data=excel_data,
+                        file_name=f"{file_basename}_{idx+1}_表格提取.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key=f"dl_{idx}_{item['filename']}"
+                    )
+                    
+                    # 👇 3. 新增：多模型工作流看板 (用内部 expander 和 tabs 优雅折叠)
+                    with st.expander("🛠️ 查看各模型原始处理过程 (折叠/展开)"):
+                        dbg = item["debug_info"]
+                        extractors = dbg.get("extractors", {})
+                        reviewer = dbg.get("reviewer")
+                        
+                        # 动态生成标签页的标题
+                        tabs_titles = [f"🔍 提取端 [{m}]" for m in extractors.keys()]
+                        if reviewer:
+                            tabs_titles.append(f"⚖️ 裁判端 [{reviewer['model']}]")
+                            
+                        if tabs_titles:
+                            tabs = st.tabs(tabs_titles)
+                            
+                            # 渲染每个提取模型的内容
+                            for t_idx, m_name in enumerate(extractors.keys()):
+                                with tabs[t_idx]:
+                                    st.markdown(extractors[m_name])
+                            
+                            # 渲染裁判模型的内容
+                            if reviewer:
+                                with tabs[-1]:
+                                    st.markdown(reviewer["result"])
