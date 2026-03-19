@@ -1,3 +1,4 @@
+# modules/data_analysis/agent.py
 import glob
 import tempfile
 from contextlib import redirect_stdout
@@ -10,91 +11,90 @@ import os
 import io
 import re
 import core.paths
-# 【修改1】：引入我们平台专属的 reporter
 from modules.data_analysis.reporter import generate_html_report
 from core.prompts import (
     DA_PLANNER_SYSTEM, DA_CODER_SYSTEM, DA_REFLECT_SYSTEM, 
     DA_ANALYST_SYSTEM, DA_FOLLOWUP_SYSTEM
 )
 
-# 【修改2】：引入路径管家，确保报告存放在 global_data 里
-from core.paths import get_upload_path
-
-def run_agent_pipeline(df: pd.DataFrame, user_query: str, api_key: str, api_base: str):
+def run_agent_pipeline(dfs: dict, user_query: str, api_key: str, api_base: str):
+    """
+    接收的 dfs 是一个字典，格式为 {"表名": DataFrame, ...}
+    """
     current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
-    
-    # 【修改3】：强制将 HTML 报告保存到我们规定的全局目录中
     report_out = os.path.join(str(core.paths.GLOBAL_DATA_DIR), f"数据分析报告_{current_time}.html")
 
     # ==========================================
-    # 【数据预处理】终极数据洗手池 
+    # 【多表预处理】遍历字典，对每一张表进行深度清洗
     # ==========================================
-    df.dropna(how='all', inplace=True)
-    df.dropna(axis=1, how='all', inplace=True)
-    df = df.loc[:, ~df.columns.astype(str).str.contains('^Unnamed')]
-    df.columns = df.columns.astype(str).str.strip().str.replace('\n', '').str.replace('\r', '').str.replace('　', '')
+    cleaned_dfs = {}
+    dataset_info_list = []
     
-    if df.empty or len(df.columns) == 0:
-        error_html = "<h2 style='color:red;'>❌ 数据读取失败</h2><p>表格无有效数据。</p>"
+    for table_name, df in dfs.items():
+        # 清洗逻辑
+        df.dropna(how='all', inplace=True)
+        df.dropna(axis=1, how='all', inplace=True)
+        df = df.loc[:, ~df.columns.astype(str).str.contains('^Unnamed')]
+        df.columns = df.columns.astype(str).str.strip().str.replace('\n', '').str.replace('\r', '').str.replace('　', '')
+        
+        if df.empty or len(df.columns) == 0:
+            continue # 如果这张表洗空了，直接跳过
+            
+        for col in df.columns:
+            if df[col].dtype == 'object':
+                df[col] = df[col].replace(['-', '--', '无', 'N/A', 'NA', 'null', ''], pd.NA)
+                temp_col = df[col].astype(str).str.replace(r'[¥$,\s]', '', regex=True)
+                converted = pd.to_numeric(temp_col, errors='coerce')
+                if converted.notna().mean() > 0.5:
+                    df[col] = converted
+                    
+        cleaned_dfs[table_name] = df
+        
+        # 组装每张表的摘要信息供大模型参考
+        cols_str = ", ".join(df.columns)
+        sample_str = df.head(3).fillna("空值(NaN)").to_string()
+        dataset_info_list.append(f"📦【表名】: {table_name}\n【字段】: {cols_str}\n【数据样本】:\n{sample_str}\n")
+        
+    if not cleaned_dfs:
+        error_html = "<h2 style='color:red;'>❌ 数据处理失败</h2><p>所有上传的表格均无有效数据。</p>"
         with open(report_out, "w", encoding="utf-8") as f: f.write(error_html)
-        return error_html, report_out, {}  # 【修改】增加第三个返回值，返回空上下文
+        return error_html, report_out, {}
+        
+    # 合并所有表的信息大纲
+    dataset_summary = "\n".join(dataset_info_list)
 
-    for col in df.columns:
-        if df[col].dtype == 'object':
-            df[col] = df[col].replace(['-', '--', '无', 'N/A', 'NA', 'null', ''], pd.NA)
-            temp_col = df[col].astype(str).str.replace(r'[¥$,\s]', '', regex=True)
-            converted = pd.to_numeric(temp_col, errors='coerce')
-            if converted.notna().mean() > 0.5:
-                df[col] = converted
-
-    columns_str = ", ".join(df.columns)
-    sample_str = df.head(5).fillna("空值(NaN)").to_string()
-    
     if not user_query or not user_query.strip():
-        user_query = f"对数据全面分析，字段包括：{columns_str}。计算各数值列的统计摘要，画出关键指标对比图表。"
-        st.info("💡 用户未输入需求，系统使用默认探索指令。")
+        user_query = "请对环境中加载的所有数据表进行全面扫描。尝试寻找可以关联（merge）的维度进行深入挖掘，并分别输出核心图表。"
+        st.info("💡 用户未输入需求，系统将开启多表默认探索模式。")
 
     # ==========================================
     # 🌟 异构模型配置
     # ==========================================
-    llm_coder = ChatOpenAI(
-        temperature=0, model="deepseek-v3-0324",
-        api_key=api_key, base_url=api_base, timeout=120
-    )
-    llm_planner = ChatOpenAI(
-        temperature=0, model="deepseek-v3-0324",
-        api_key=api_key, base_url=api_base, timeout=60
-    )
-    llm_analyst = ChatOpenAI(
-        temperature=0.3, model="deepseek-v3-0324",
-        api_key=api_key, base_url=api_base, timeout=120
-    )
+    llm_coder = ChatOpenAI(temperature=0, model="deepseek-v3-0324", api_key=api_key, base_url=api_base, timeout=120)
+    llm_planner = ChatOpenAI(temperature=0, model="deepseek-v3-0324", api_key=api_key, base_url=api_base, timeout=60)
+    llm_analyst = ChatOpenAI(temperature=0.3, model="deepseek-v3-0324", api_key=api_key, base_url=api_base, timeout=120)
 
     # ==========================================
     # Node 0：🗺️ Planner Agent
     # ==========================================
-    st.markdown("### 🗺️ Planner Agent 正在分析数据，制定分析计划...")
-
+    st.markdown("### 🗺️ Planner Agent 正在宏观审视所有表格，制定分析计划...")
     planner_prompt = ChatPromptTemplate.from_messages([
         ("system", DA_PLANNER_SYSTEM),
-        ("user", "表头: {columns}\n\n数据样本:\n{sample}\n\n用户需求: {query}")
+        ("user", "以下是本次加载的所有数据表大纲：\n\n{dataset_summary}\n\n用户需求: {query}")
     ])
 
     analysis_plan = ""
     try:
         plan_placeholder = st.empty()
         count = 0
-        for chunk in (planner_prompt | llm_planner).stream({
-            "columns": columns_str, "sample": sample_str, "query": user_query
-        }):
+        for chunk in (planner_prompt | llm_planner).stream({"dataset_summary": dataset_summary, "query": user_query}):
             analysis_plan += chunk.content
             count += 1
-            if count % 8 == 0:  # 节流
-                plan_placeholder.markdown(f"```text\n{analysis_plan}▌\n```")
+            if count % 8 == 0: plan_placeholder.markdown(f"```text\n{analysis_plan}▌\n```")
         plan_placeholder.markdown(f"```text\n{analysis_plan}\n```")
-        st.success("✅ 分析计划制定完毕！")
+        st.success("✅ 多表联合分析计划制定完毕！")
     except Exception as e:
-        analysis_plan = "通用数据分析：趋势、对比、异常检测"
+        analysis_plan = "通用多表关联分析：趋势、对比、数据融合挖掘"
         st.error(f"❌ Planner 调用失败，使用默认计划：{e}")
 
     # ==========================================
@@ -114,24 +114,17 @@ def run_agent_pipeline(df: pd.DataFrame, user_query: str, api_key: str, api_base
 
         if reflexion_memory:
             memory_str = "\n".join([
-                f"【第{m['attempt']}次失败反思】\n"
-                f"  错误信息: {m['error']}\n"
-                f"  根因判断: {m['root_cause']}\n"
-                f"  修复策略: {m['fix_strategy']}\n"
-                f"  禁止重蹈: {m['avoid']}"
+                f"【第{m['attempt']}次失败反思】\n  报错: {m['error']}\n  对策: {m['fix_strategy']}"
                 for m in reflexion_memory
             ])
         else:
             memory_str = "无历史报错，首次尝试。"
 
-        st.markdown(f"### 👨‍💻 程序员 Agent 开始写代码 (第 {attempt}/{max_retries} 次)")
-        if reflexion_memory:
-            st.caption(f"已携带 {len(reflexion_memory)} 条反思记忆")
+        st.markdown(f"### 👨‍💻 程序员 Agent 开始跨表写代码 (第 {attempt}/{max_retries} 次)")
 
-        # 【修改】：防崩溃铁律升级，强调“独立容错，继续执行”
         code_prompt = ChatPromptTemplate.from_messages([
             ("system", DA_CODER_SYSTEM),
-            ("user", "分析需求：{query}\n\n【重要】真实数据样本预览：\n{sample}")
+            ("user", "分析需求：{query}\n\n【重要】已加载的真实数据集概览：\n{dataset_summary}")
         ])
 
         try:
@@ -139,43 +132,25 @@ def run_agent_pipeline(df: pd.DataFrame, user_query: str, api_key: str, api_base
             code_placeholder = st.empty()
             count = 0
             for chunk in (code_prompt | llm_coder).stream({
-                "columns_str": columns_str, "analysis_plan": analysis_plan,
-                "memory_str": memory_str, "query": user_query, "sample": sample_str
+                "dataset_summary": dataset_summary, "analysis_plan": analysis_plan,
+                "memory_str": memory_str, "query": user_query
             }):
                 raw_code += chunk.content
                 count += 1
-                if count % 8 == 0:  # 节流
-                    code_placeholder.markdown(f"```python\n{raw_code}▌\n```")
+                if count % 8 == 0: code_placeholder.markdown(f"```python\n{raw_code}▌\n```")
             code_placeholder.markdown(f"```python\n{raw_code}\n```")
 
-            st.info("⚙️ 代码接收完毕，开始在沙盒中执行...")
+            st.info("⚙️ 代码接收完毕，开始注入全部数据并执行沙盒...")
             clean_code = raw_code.replace("```python", "").replace("```", "").strip()
             
-            FULLWIDTH_MAP = {
-                "，": ",", "。": ".", "：": ":", "；": ";",
-                "（": "(", "）": ")", "【": "[", "】": "]",
-                "“": '"', "”": '"', "‘": "'", "’": "'",
-                "！": "!", "？": "?", "…": "...", "—": "-", "·": ".",
-            }
-            for zh, en in FULLWIDTH_MAP.items():
-                clean_code = clean_code.replace(zh, en)
-            
-            first_line = clean_code.strip().splitlines()[0] if clean_code.strip() else ""
-            if first_line and "一" <= first_line[0] <= "鿿":
-                execution_error = f"LLM输出了聊天文字而非代码：{first_line[:50]}"
-                st.error(f"❌ {execution_error}")
-                reflexion_memory.append({"attempt": attempt, "error": execution_error,
-                    "fix_strategy": "必须直接输出Python代码，禁止聊天或提问！"})
-                continue
+            FULLWIDTH_MAP = {"，": ",", "。": ".", "：": ":", "；": ";", "（": "(", "）": ")"}
+            for zh, en in FULLWIDTH_MAP.items(): clean_code = clean_code.replace(zh, en)
             
             agg_prefix = (
-                "import matplotlib\n"
-                "import matplotlib.pyplot as plt\n"
-                "plt.switch_backend('agg')\n"
+                "import matplotlib\nimport matplotlib.pyplot as plt\nplt.switch_backend('agg')\n"
                 "plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'Arial Unicode MS']\n"
                 "plt.rcParams['axes.unicode_minus'] = False\n"
-                f"__chart_dir__ = r'{chart_dir}'\n"
-                "import os as __os__\n"
+                f"__chart_dir__ = r'{chart_dir}'\nimport os as __os__\n"
                 "if not hasattr(plt, '_original_savefig'):\n"
                 "    plt._original_savefig = plt.savefig\n"
                 "    def __patched_savefig__(fname, *a, **kw):\n"
@@ -187,7 +162,6 @@ def run_agent_pipeline(df: pd.DataFrame, user_query: str, api_key: str, api_base
             clean_code = agg_prefix + clean_code
         except Exception as e:
             execution_error = f"API超时或断开: {e}"
-            st.error(f"❌ {execution_error}")
             continue
 
         captured_output = io.StringIO()
@@ -196,87 +170,55 @@ def run_agent_pipeline(df: pd.DataFrame, user_query: str, api_key: str, api_base
             import matplotlib
             matplotlib.use("Agg")
             import matplotlib.pyplot as _plt
-            _plt.rcParams["font.sans-serif"] = ["SimHei", "Microsoft YaHei", "Arial Unicode MS"]
-            _plt.rcParams["axes.unicode_minus"] = False
+            
+            # 👇 核心注入：向执行沙盒中注入 `dfs` 字典！
+            first_df_name = list(cleaned_dfs.keys())[0]
+            exec_env = {"dfs": cleaned_dfs, "df": cleaned_dfs[first_df_name], "pd": pd, "os": os, "re": re}
 
             with redirect_stdout(captured_output):
-                exec_env = {"df": df, "pd": pd, "os": os, "re": re}
                 exec(clean_code, exec_env)
                 
             charts_found = glob.glob(os.path.join(chart_dir, "chart_*.png"))
             captured_preview = captured_output.getvalue().strip()
             if captured_preview:
-                st.success(f"✅ 代码执行成功！已生成图表: {[os.path.basename(c) for c in charts_found]}")
-                with st.expander("👀 查看运行数据输出 (供分析师参考)"):
-                    st.code(captured_preview[:2000] + ("\n...(已省略)" if len(captured_preview)>2000 else ""))
+                st.success(f"✅ 代码执行成功！共生成图表: {len(charts_found)} 张")
             else:
-                st.warning("⚠️ 警告：代码无任何 print 输出，分析师将无真实数据可用！")
+                st.warning("⚠️ 代码未输出任何分析数据！")
         except Exception as e:
             execution_error = str(e)
             st.error(f"❌ 执行报错：{execution_error}")
 
-            st.warning("🔁 Reflexion：正在反思失败原因，生成修复记忆...")
             reflect_prompt = ChatPromptTemplate.from_messages([
                 ("system", DA_REFLECT_SYSTEM),
                 ("user", "报错信息: {error}\n\n出错代码片段:\n{code}")
             ])
-
-            reflection = {"attempt": attempt, "error": execution_error,
-                          "root_cause": "", "fix_strategy": "", "avoid": ""}
+            reflection = {"attempt": attempt, "error": execution_error, "root_cause": "", "fix_strategy": "", "avoid": ""}
             try:
                 reflect_raw = ""
-                reflect_placeholder = st.empty()
-                count = 0
-                for chunk in (reflect_prompt | llm_coder).stream({
-                    "error": execution_error, "code": clean_code[-2000:]
-                }):
+                for chunk in (reflect_prompt | llm_coder).stream({"error": execution_error, "code": clean_code[-2000:]}):
                     reflect_raw += chunk.content
-                    count += 1
-                    if count % 8 == 0:  # 节流
-                        reflect_placeholder.markdown(f"```text\n{reflect_raw}▌\n```")
-                reflect_placeholder.markdown(f"```text\n{reflect_raw}\n```")
-
                 for line in reflect_raw.splitlines():
-                    if line.startswith("根因判断:"):
-                        reflection["root_cause"] = line.replace("根因判断:", "").strip()
-                    elif line.startswith("修复策略:"):
-                        reflection["fix_strategy"] = line.replace("修复策略:", "").strip()
-                    elif line.startswith("禁止重蹈:"):
-                        reflection["avoid"] = line.replace("禁止重蹈:", "").strip()
-
-                st.success(f"✅ 反思完成，记忆已写入（第 {attempt} 条）")
-            except Exception as re_err:
-                reflection["root_cause"] = execution_error
-                reflection["fix_strategy"] = "检查语法和数据类型"
-                reflection["avoid"] = "避免假设列名和数据格式"
-                st.error(f"❌ 反思模型调用失败，使用默认记忆：{re_err}")
-
+                    if line.startswith("根因判断:"): reflection["root_cause"] = line.replace("根因判断:", "").strip()
+                    elif line.startswith("修复策略:"): reflection["fix_strategy"] = line.replace("修复策略:", "").strip()
+            except Exception:
+                reflection["fix_strategy"] = "检查 DataFrame 的键名和字典调用方式。"
             reflexion_memory.append(reflection)
 
     data_insights = captured_output.getvalue()
     generated_charts = glob.glob(os.path.join(chart_dir, "chart_*.png"))
 
     if execution_error:
-        st.error(f"🚨 触发熔断机制：代码修复超过 {max_retries} 次依然失败，立即停止后续 Agent 调用以节省 Token。")
-        memory_html = "".join([f"<li style='margin-bottom:8px;'><b>第{m['attempt']}次反思：</b> {m['root_cause']}<br><i style='color:#666;'>对策：{m['fix_strategy']}</i></li>" for m in reflexion_memory])
-        error_html = f"<h2>⚠️ 数据分析中断</h2><pre>{execution_error}</pre><ul>{memory_html}</ul>"
-        with open(report_out, "w", encoding="utf-8") as f:
-            f.write(error_html)
-        return error_html, report_out, {} # 【修改】增加第三个返回值
+        error_html = f"<h2>⚠️ 数据分析中断</h2><pre>{execution_error}</pre>"
+        with open(report_out, "w", encoding="utf-8") as f: f.write(error_html)
+        return error_html, report_out, {} 
 
-    chart_status = f"生成的图表文件有：{[os.path.basename(c) for c in generated_charts]}。只能使用对应的占位符！"
+    chart_status = f"生成的图表文件有：{[os.path.basename(c) for c in generated_charts]}。"
 
     # ==========================================
     # Node 3：🧑‍💼 终极分析师 Agent
     # ==========================================
-    st.markdown("### 🧑‍💼 分析师 Agent 正在撰写最终洞察报告 (直出模式)...")
-
-    # 【修改】：增加了“部分容错铁律”，不要因为缺图就放弃
-    analyst_prompt = ChatPromptTemplate.from_messages([
-        ("system", DA_ANALYST_SYSTEM),
-        ("user", "原需求：{query}")
-    ])
-
+    st.markdown("### 🧑‍💼 分析师 Agent 正在撰写最终多表融合洞察报告...")
+    analyst_prompt = ChatPromptTemplate.from_messages([("system", DA_ANALYST_SYSTEM), ("user", "原需求：{query}")])
     final_markdown = ""
     try:
         raw_report = ""
@@ -288,50 +230,26 @@ def run_agent_pipeline(df: pd.DataFrame, user_query: str, api_key: str, api_base
         }):
             raw_report += chunk.content
             count += 1
-            if count % 8 == 0:  # 节流
-                report_placeholder.markdown(raw_report + "▌")
+            if count % 8 == 0: report_placeholder.markdown(raw_report + "▌")
         report_placeholder.markdown(raw_report)
             
-        st.success("✅ 最终报告撰写完毕！")
         match = re.search(r'<FINAL_REPORT>\s*(.*?)\s*</FINAL_REPORT>', raw_report, re.DOTALL)
         final_markdown = match.group(1).strip() if match else raw_report.strip()
     except Exception as e:
         final_markdown = f"报告生成失败: {e}"
-        st.error(final_markdown)
 
-    # ==========================================
-    # Node 5：⚙️ 渲染引擎
-    # ==========================================
     import shutil
-    copied = []
     for src in glob.glob(os.path.join(chart_dir, "chart_*.png")):
-        dst = os.path.basename(src)
-        shutil.copy2(src, dst)
-        copied.append(dst)
+        shutil.copy2(src, os.path.basename(src))
 
     html_string = generate_html_report(final_markdown, report_out)
+    return html_string, report_out, {"plan": analysis_plan, "data": data_insights}
 
-    # 【修改】：将分析上下文打包返回，留给追问 Agent 使用
-    context_dict = {
-        "plan": analysis_plan,
-        "data": data_insights
-    }
-    return html_string, report_out, context_dict
-
-
-# 【新增】：追问与优化专属 Agent
+# 追问模块 (无需改动)
 def run_followup_chat(user_query: str, chat_history: list, context_data: dict, api_key: str, api_base: str):
     llm_chat = ChatOpenAI(temperature=0.4, model="deepseek-v3-0324", api_key=api_key, base_url=api_base)
-    
-    system_prompt = DA_FOLLOWUP_SYSTEM
-    
-    messages = [("system", system_prompt.format(data=context_data.get("data", "无数据")))]
-    
-    # 填入历史对话记录
-    for msg in chat_history:
-        messages.append((msg["role"], msg["content"]))
-        
+    messages = [("system", DA_FOLLOWUP_SYSTEM.format(data=context_data.get("data", "无数据")))]
+    for msg in chat_history: messages.append((msg["role"], msg["content"]))
     messages.append(("user", user_query))
     prompt = ChatPromptTemplate.from_messages(messages)
-    
     return (prompt | llm_chat).stream({})
