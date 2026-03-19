@@ -28,5 +28,5 @@ class Config:
 
     CHUNK_SIZE = 1000
     CHUNK_OVERLAP = 100
-    RETRIEVER_TOP_K = 5
-    RERANK_TOP_K = 3
+    RETRIEVER_TOP_K = 15
+    RERANK_TOP_K = 5

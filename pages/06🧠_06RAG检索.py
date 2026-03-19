@@ -72,7 +72,7 @@ def reload_knowledge_base():
 # ==========================================
 with st.sidebar:
     st.title("📚 知识库中心")
-    st.subheader("📂 已存文档")
+    # st.subheader("📂 已存文档")
     ingested_data = get_ingested_files()
     
     if ingested_data:

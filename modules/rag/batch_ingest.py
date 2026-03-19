@@ -126,7 +126,15 @@ def rebuild_index_from_md():
 
     text_splitter = MarkdownTextSplitter(chunk_size=Config.CHUNK_SIZE, chunk_overlap=Config.CHUNK_OVERLAP)
     chunks = text_splitter.split_documents(all_docs)
+
     
+    # 👇👇👇 核心修复：给每个切片的文本强行加上文档来源作为“思想钢印”！ 👇👇👇
+    for chunk in chunks:
+        source_name = chunk.metadata.get("source", "未知文档")
+        chunk.page_content = f"【此片段摘自文档：{source_name}】\n" + chunk.page_content
+    # 👆👆👆 修复结束 👆👆👆
+
+
     if os.path.exists(Config.DB_DIR):
         shutil.rmtree(Config.DB_DIR) 
     os.makedirs(Config.DB_DIR)

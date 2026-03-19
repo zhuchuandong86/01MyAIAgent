@@ -128,7 +128,7 @@ class VisualTelecomAnalyst:
                 self.config = yaml.safe_load(f)
                 self.golden_sqls = self.config.get("golden_sqls", [])
             # 【增加强提示】：在终端打印读取结果，防止静默失败
-            print(f"✅ 成功从 {os.path.basename(yaml_path)} 读取了 {len(self.golden_sqls)} 条黄金案例！")
+            # print(f"✅ 成功从 {os.path.basename(yaml_path)} 读取了 {len(self.golden_sqls)} 条黄金案例！")
         except FileNotFoundError:
             print(f"❌ 严重警告：找不到任何 YAML 配置文件，AI 将失去参考记忆！")
             self.config = {}
@@ -146,7 +146,7 @@ class VisualTelecomAnalyst:
             
             if os.path.exists(faiss_dir):
                 # ⚡ 极速模式：如果硬盘上已经有了，直接 0.01 秒秒读，不调 API！
-                print("⚡ [无线问数] 极速命中本地 SQL 向量库缓存...")
+                # print("⚡ [无线问数] 极速命中本地 SQL 向量库缓存...")
                 self.vector_store = FAISS.load_local(faiss_dir, self.embeddings, allow_dangerous_deserialization=True)
             else:
                 # ⏳ 只有真正第一次运行，或者你删了缓存文件夹，才会去调模型算向量

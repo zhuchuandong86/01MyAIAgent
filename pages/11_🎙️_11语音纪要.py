@@ -1,7 +1,12 @@
-# pages/11_🎙️_语音纪要生成.py
+# pages/11_🎙️_11语音纪要.py
 import streamlit as st
 import os
 import tempfile
+
+# 💡 方案一：开启国内镜像加速兜底
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+
+import core.paths
 from core.settings import settings
 from core.token_tracker import log_usage
 from langchain_openai import ChatOpenAI
@@ -45,7 +50,6 @@ if uploaded_audio:
     st.audio(uploaded_audio)
     
     if st.button("🚀 启动本地极速转写 (纯本地执行，数据不泄露)", type="primary"):
-        # 延迟导入，防止没装库时整个页面直接崩溃
         try:
             from faster_whisper import WhisperModel
         except ImportError:
@@ -55,25 +59,34 @@ if uploaded_audio:
         with st.status("🎧 正在加载本地听写引擎并扫描音频...", expanded=True) as status:
             tmp_path = ""
             try:
-                # 1. 将文件存入临时目录
                 ext = uploaded_audio.name.split('.')[-1]
                 with tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}") as tmp_file:
                     tmp_file.write(uploaded_audio.getvalue())
                     tmp_path = tmp_file.name
                 
-                st.write(f"🔄 正在唤醒 `{whisper_size}` 模型 (设备: {compute_device})...")
-                # 2. 初始化模型 (int8 压缩量化，极大节省内存)
-                model = WhisperModel(whisper_size, device=compute_device, compute_type="int8")
+                # 👇👇👇 核心修复：内网智能离线加载逻辑 👇👇👇
+                model_identifier = whisper_size
+                # 尝试去 global_data/models/faster-whisper-{size} 寻找离线模型
+                local_model_dir = os.path.join(str(core.paths.GLOBAL_DATA_DIR), "models", f"faster-whisper-{whisper_size}")
                 
-                st.write("🏃‍♂️ 开始执行语音识别，请稍候...")
-                segments, info = model.transcribe(tmp_path, beam_size=5)
+                if os.path.exists(local_model_dir) and os.listdir(local_model_dir):
+                    st.write(f"🔄 发现内网离线模型仓库，正在从本地加载 `{whisper_size}` ...")
+                    model_identifier = local_model_dir # 如果有本地文件夹，直接传绝对路径给它！
+                else:
+                    st.write(f"🔄 本地未找到离线文件，正在尝试从镜像站下载 `{whisper_size}` 模型...")
                 
-                # 3. 拼接转写结果
+                # 初始化模型 (不管是字符串名字还是本地路径，WhisperModel 都能自动识别)
+                model = WhisperModel(model_identifier, device=compute_device, compute_type="int8")
+                # 👆👆👆 修复结束 👆👆👆
+                
+                st.write("🏃‍♂️ 开始执行语音识别 (已开启 VAD 内存防爆机制)，请稍候...")
+                # 加上 vad_filter=True，彻底解决长音频内存溢出问题
+                segments, info = model.transcribe(tmp_path, beam_size=5, vad_filter=True)
+                
                 full_text = ""
                 progress_bar = st.progress(0)
                 for segment in segments:
                     full_text += segment.text + " "
-                    # 粗略估算进度
                     progress_bar.progress(min(segment.end / info.duration, 1.0))
                 
                 st.session_state.raw_transcript = full_text.strip()
@@ -82,20 +95,19 @@ if uploaded_audio:
             except Exception as e:
                 status.update(label="❌ 语音转写发生致命错误", state="error", expanded=True)
                 st.error(f"详细报错: {e}")
+                st.info("💡 如果是网络报错，请按照代码里的注释，提前在有网的电脑上下载好模型放入 `global_data/models/` 目录中。")
             finally:
-                # 阅后即焚清理音频残骸
                 if tmp_path and os.path.exists(tmp_path):
                     os.remove(tmp_path)
 
 # ==========================================
-# 3. 阶段二：人工核对与双核智能纪要 (A/B Test)
+# 3. 阶段二：人工核对与双核智能纪要 (A/B Test) (后续保持不变)
 # ==========================================
 if st.session_state.raw_transcript:
     st.divider()
     st.markdown("### 📝 第二步：核对底稿与智能梳理")
     st.caption("以下是 AI 听写的原始底稿。您可以在这里手动修正错别字，随后大模型将根据此底稿自动**区分说话人**并生成纪要。")
     
-    # 允许用户手动微调底稿
     edited_text = st.text_area("✍️ 原始语音底稿 (可修改)", value=st.session_state.raw_transcript, height=200)
     
     if st.button("⚔️ 启动双核纪要提炼 (含智能区分说话人)", type="primary", use_container_width=True):
@@ -103,13 +115,11 @@ if st.session_state.raw_transcript:
             st.warning("底稿为空，无法生成！")
             st.stop()
             
-        # 🌟 核心：通过精密的 Prompt 让大模型进行“语义级声纹分离”
         prompt_template = ChatPromptTemplate.from_template(SPEAKER_DIARIZATION_PROMPT)
         
         st.markdown("---")
         col_a, col_b = st.columns(2)
         
-        # 封装与 07_文案整理 完全一致的流式渲染函数
         def run_summary(model_name, container, title_prefix, color_emoji):
             with container:
                 with st.container(border=True):
@@ -122,7 +132,7 @@ if st.session_state.raw_transcript:
                         model=model_name,
                         api_key=settings.API_KEY,
                         base_url=settings.API_BASE,
-                        temperature=0.2, # 纪要需要确定性
+                        temperature=0.2, 
                         model_kwargs={"stream_options": {"include_usage": True}} 
                     )
                     
@@ -134,7 +144,6 @@ if st.session_state.raw_transcript:
                                 placeholder.markdown(full_summary + " ▌")
                             placeholder.markdown(full_summary)
                             
-                            # 计费拦截
                             tokens = cb.total_tokens
                             if tokens == 0:
                                 tokens = int((len(edited_text) + len(full_summary)) * 1.2)
@@ -153,7 +162,6 @@ if st.session_state.raw_transcript:
                         except Exception as e:
                             placeholder.error(f"❌ 生成失败:\n {e}")
 
-        # 左栏跑方案 A，右栏跑方案 B
         with st.spinner(f"正在调动 {model_a} 分析语境并重构纪要 ..."):
             run_summary(model_a, col_a, "方案 A", "🔵")
             

@@ -17,7 +17,7 @@ os.environ['NO_PROXY'] = INTERNAL_URL
 
 def process_single_page(image_path, page_num):
     """视觉引擎：负责单张图片的解析与数据清洗"""
-    print(f"👉 正在深度解析并清洗页面 {page_num}: {os.path.basename(image_path)}...")
+    print(f"👉 {MODEL_VISION}正在深度解析并清洗页面 {page_num}: {os.path.basename(image_path)}...")
     try:
         base64_img = encode_and_compress_image(image_path)
     except Exception as e:
