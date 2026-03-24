@@ -13,6 +13,14 @@ from core.prompts import IMG2EXCEL_EXTRACT_PROMPT, IMG2EXCEL_REVIEWER_PROMPT
 
 def _call_vision_model(client: OpenAI, image_base64: str, model_name: str, prompt_text: str, max_retries: int = 3) -> str:
     last_exception = None
+    
+    # 👇 核心改进：智能判断，如果是 deepseek-ocr，强行替换为官方专属魔法指令！
+    is_deepseek_ocr = "deepseek-ocr" in model_name.lower()
+    if is_deepseek_ocr:
+        # 去掉触发坐标框的底层控制符，直接用最简明扼要的英文指令
+        prompt_text = "Extract the table from the image and output in Markdown format."
+        print(f"💡 [智能拦截] 检测到 {model_name}，已切换为专属极简指令！")
+    
     for attempt in range(max_retries):
         try:
             response = client.chat.completions.create(
@@ -28,6 +36,10 @@ def _call_vision_model(client: OpenAI, image_base64: str, model_name: str, promp
                 max_tokens=4096
             )
             content = response.choices[0].message.content
+            
+            # 👇 核心兜底：DeepSeek-OCR 极大概率不会乖乖写 <table_output> 标签，我们帮它套上！
+            if is_deepseek_ocr and "<table_output>" not in content:
+                content = f"<table_output>\n{content}\n</table_output>"
             
             if hasattr(response, 'usage') and response.usage:
                 tokens = response.usage.total_tokens
@@ -111,10 +123,9 @@ def process_image_to_df(image_bytes: bytes, api_key: str, api_base: str, extract
     base64_img = base64.b64encode(compressed_bytes).decode('utf-8')
     client = OpenAI(api_key=api_key, base_url=api_base)
     
-    # 👇 核心改进：创建一个字典，用于记录每一个模型的原始输出
     debug_info = {
-        "extractors": {}, # 存放并行的提取模型结果
-        "reviewer": None  # 存放裁判模型的整合结果
+        "extractors": {}, 
+        "reviewer": None  
     }
     
     if len(extract_models) == 1 and not reviewer_model:
@@ -137,7 +148,6 @@ def process_image_to_df(image_bytes: bytes, api_key: str, api_base: str, extract
                     results.append(f"### 提取结果 (来自模型 {model_name}) ###\n{res}\n")
                     successful_models.append(model_name)
                     last_success_res = res  
-                    # 记录单模型结果
                     debug_info["extractors"][model_name] = res
                 except Exception as e:
                     print(f"[错误] 模型 {model_name} 彻底提取失败已被跳过: {e}")
@@ -153,10 +163,8 @@ def process_image_to_df(image_bytes: bytes, api_key: str, api_base: str, extract
             final_prompt = IMG2EXCEL_REVIEWER_PROMPT.format(extracted_results=combined_text)
             final_model = reviewer_model if reviewer_model else successful_models[0]
             md_text = _call_vision_model(client, base64_img, final_model, final_prompt)
-            # 记录裁判模型结果
             debug_info["reviewer"] = {"model": final_model, "result": md_text}
 
     df = parse_markdown_to_df(md_text)
     
-    # 返回值增加 debug_info，供前端渲染
     return df, md_text, debug_info

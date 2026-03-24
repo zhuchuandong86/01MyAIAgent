@@ -1,0 +1,274 @@
+# modules/data_analysis/agent.py
+import glob
+import tempfile
+from contextlib import redirect_stdout
+import pandas as pd
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
+import streamlit as st
+from datetime import datetime
+import os
+import io
+import re
+import core.paths
+from modules.data_analysis.reporter import generate_html_report
+from core.schemas import CodeReflection
+from core.prompts import (
+    DA_PLANNER_SYSTEM, DA_CODER_SYSTEM, DA_REFLECT_SYSTEM, 
+    DA_ANALYST_SYSTEM, DA_FOLLOWUP_SYSTEM
+)
+
+def run_agent_pipeline(dfs: dict, user_query: str, api_key: str, api_base: str):
+    """
+    接收的 dfs 是一个字典，格式为 {"表名": DataFrame, ...}
+    """
+    current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+    report_out = os.path.join(str(core.paths.GLOBAL_DATA_DIR), f"数据分析报告_{current_time}.html")
+
+    # ==========================================
+    # 【多表预处理】遍历字典，对每一张表进行深度清洗
+    # ==========================================
+    cleaned_dfs = {}
+    dataset_info_list = []
+    
+    for table_name, df in dfs.items():
+        # 清洗逻辑
+        df.dropna(how='all', inplace=True)
+        df.dropna(axis=1, how='all', inplace=True)
+        df = df.loc[:, ~df.columns.astype(str).str.contains('^Unnamed')]
+        df.columns = df.columns.astype(str).str.strip().str.replace('\n', '').str.replace('\r', '').str.replace('　', '')
+        
+        if df.empty or len(df.columns) == 0:
+            continue # 如果这张表洗空了，直接跳过
+            
+        for col in df.columns:
+            if df[col].dtype == 'object':
+                df[col] = df[col].replace(['-', '--', '无', 'N/A', 'NA', 'null', ''], pd.NA)
+                temp_col = df[col].astype(str).str.replace(r'[¥$,\s]', '', regex=True)
+                converted = pd.to_numeric(temp_col, errors='coerce')
+                if converted.notna().mean() > 0.5:
+                    df[col] = converted
+                    
+        cleaned_dfs[table_name] = df
+        
+        # 组装每张表的摘要信息供大模型参考
+        cols_str = ", ".join(df.columns)
+        sample_str = df.head(3).fillna("空值(NaN)").to_string()
+        dataset_info_list.append(f"📦【表名】: {table_name}\n【字段】: {cols_str}\n【数据样本】:\n{sample_str}\n")
+        
+    if not cleaned_dfs:
+        error_html = "<h2 style='color:red;'>❌ 数据处理失败</h2><p>所有上传的表格均无有效数据。</p>"
+        with open(report_out, "w", encoding="utf-8") as f: f.write(error_html)
+        return error_html, report_out, {}
+        
+    # 合并所有表的信息大纲
+    dataset_summary = "\n".join(dataset_info_list)
+
+    if not user_query or not user_query.strip():
+        user_query = "请对环境中加载的所有数据表进行全面扫描。尝试寻找可以关联（merge）的维度进行深入挖掘，并分别输出核心图表。"
+        st.info("💡 用户未输入需求，系统将开启多表默认探索模式。")
+
+    # ==========================================
+    # 🌟 异构模型配置
+    # ==========================================
+    llm_coder = ChatOpenAI(temperature=0, model="deepseek-v3-0324", api_key=api_key, base_url=api_base, timeout=120)
+    llm_planner = ChatOpenAI(temperature=0, model="deepseek-v3-0324", api_key=api_key, base_url=api_base, timeout=60)
+    llm_analyst = ChatOpenAI(temperature=0.3, model="deepseek-v3-0324", api_key=api_key, base_url=api_base, timeout=120)
+
+    # ==========================================
+    # Node 0：🗺️ Planner Agent
+    # ==========================================
+    st.markdown("### 🗺️ Planner Agent 正在宏观审视所有表格，制定分析计划...")
+    planner_prompt = ChatPromptTemplate.from_messages([
+        ("system", DA_PLANNER_SYSTEM),
+        ("user", "以下是本次加载的所有数据表大纲：\n\n{dataset_summary}\n\n用户需求: {query}")
+    ])
+
+    analysis_plan = ""
+    try:
+        plan_placeholder = st.empty()
+        count = 0
+        for chunk in (planner_prompt | llm_planner).stream({"dataset_summary": dataset_summary, "query": user_query}):
+            analysis_plan += chunk.content
+            count += 1
+            if count % 8 == 0: plan_placeholder.markdown(f"```text\n{analysis_plan}▌\n```")
+        plan_placeholder.markdown(f"```text\n{analysis_plan}\n```")
+        st.success("✅ 多表联合分析计划制定完毕！")
+    except Exception as e:
+        analysis_plan = "通用多表关联分析：趋势、对比、数据融合挖掘"
+        st.error(f"❌ Planner 调用失败，使用默认计划：{e}")
+
+    # ==========================================
+    # Node 1 & 2：👨‍💻 程序员 Agent
+    # ==========================================
+    max_retries = 3
+    attempt = 0
+    execution_error = "Initial"
+    data_insights = ""
+    clean_code = ""
+    chart_dir = tempfile.mkdtemp(prefix="agent_charts_")
+    reflexion_memory = []
+    captured_output = io.StringIO()
+
+    while attempt < max_retries and execution_error:
+        attempt += 1
+
+        if reflexion_memory:
+            memory_str = "\n".join([
+                f"【第{m['attempt']}次失败反思】\n  报错: {m['error']}\n  对策: {m['fix_strategy']}"
+                for m in reflexion_memory
+            ])
+        else:
+            memory_str = "无历史报错，首次尝试。"
+
+        st.markdown(f"### 👨‍💻 程序员 Agent 开始跨表写代码 (第 {attempt}/{max_retries} 次)")
+
+        code_prompt = ChatPromptTemplate.from_messages([
+            ("system", DA_CODER_SYSTEM),
+            ("user", "分析需求：{query}\n\n【重要】已加载的真实数据集概览：\n{dataset_summary}")
+        ])
+
+        try:
+            raw_code = ""
+            code_placeholder = st.empty()
+            count = 0
+            for chunk in (code_prompt | llm_coder).stream({
+                "dataset_summary": dataset_summary, "analysis_plan": analysis_plan,
+                "memory_str": memory_str, "query": user_query
+            }):
+                raw_code += chunk.content
+                count += 1
+                if count % 8 == 0: code_placeholder.markdown(f"```python\n{raw_code}▌\n```")
+            code_placeholder.markdown(f"```python\n{raw_code}\n```")
+
+            st.info("⚙️ 代码接收完毕，开始注入全部数据并执行沙盒...")
+            clean_code = raw_code.replace("```python", "").replace("```", "").strip()
+            
+            FULLWIDTH_MAP = {"，": ",", "。": ".", "：": ":", "；": ";", "（": "(", "）": ")"}
+            for zh, en in FULLWIDTH_MAP.items(): clean_code = clean_code.replace(zh, en)
+            
+            agg_prefix = (
+                "import matplotlib\nimport matplotlib.pyplot as plt\nplt.switch_backend('agg')\n"
+                "plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'Arial Unicode MS']\n"
+                "plt.rcParams['axes.unicode_minus'] = False\n"
+                f"__chart_dir__ = r'{chart_dir}'\nimport os as __os__\n"
+                "if not hasattr(plt, '_original_savefig'):\n"
+                "    plt._original_savefig = plt.savefig\n"
+                "    def __patched_savefig__(fname, *a, **kw):\n"
+                "        if not __os__.path.isabs(str(fname)):\n"
+                "            fname = __os__.path.join(__chart_dir__, __os__.path.basename(str(fname)))\n"
+                "        plt._original_savefig(fname, *a, **kw)\n"
+                "    plt.savefig = __patched_savefig__\n"
+            )
+            clean_code = agg_prefix + clean_code
+        except Exception as e:
+            execution_error = f"API超时或断开: {e}"
+            continue
+
+        captured_output = io.StringIO()
+        execution_error = None
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as _plt
+            
+            # 👇 核心注入：向执行沙盒中注入 `dfs` 字典！
+            first_df_name = list(cleaned_dfs.keys())[0]
+            exec_env = {"dfs": cleaned_dfs, "df": cleaned_dfs[first_df_name], "pd": pd, "os": os, "re": re}
+
+            with redirect_stdout(captured_output):
+                exec(clean_code, exec_env)
+                
+            charts_found = glob.glob(os.path.join(chart_dir, "chart_*.png"))
+            captured_preview = captured_output.getvalue().strip()
+            if captured_preview:
+                st.success(f"✅ 代码执行成功！共生成图表: {len(charts_found)} 张")
+            else:
+                st.warning("⚠️ 代码未输出任何分析数据！")
+        except Exception as e:
+            execution_error = str(e)
+            st.error(f"❌ 执行报错：{execution_error}")
+
+            # 💡 【核心重构：Pydantic 降维打击】彻底消灭正则与字符串拆分！
+            reflect_prompt = ChatPromptTemplate.from_messages([
+                ("system", DA_REFLECT_SYSTEM),
+                ("user", "报错信息: {error}\n\n出错代码片段:\n{code}")
+            ])
+            
+            try:
+                # 让大模型严格按照 CodeReflection 这个 Pydantic 类的格式输出 JSON
+                structured_llm = llm_coder.with_structured_output(CodeReflection)
+                
+                # 直接拿到的 reflection_obj 就是一个完美的 Python 对象！
+                reflection_obj = structured_llm.invoke(
+                    reflect_prompt.format_messages(error=execution_error, code=clean_code[-2000:])
+                )
+                
+                reflection = {
+                    "attempt": attempt, 
+                    "error": execution_error, 
+                    "root_cause": reflection_obj.root_cause, 
+                    "fix_strategy": reflection_obj.fix_strategy, 
+                    "avoid": reflection_obj.avoid
+                }
+            except Exception as parse_e:
+                # 即使结构化解析极其罕见地失败了，也能优雅兜底
+                reflection = {
+                    "attempt": attempt, 
+                    "error": execution_error,
+                    "root_cause": "解析失败", 
+                    "fix_strategy": "请检查变量名、字典访问方式或使用 try-except 跳过错误", 
+                    "avoid": "避免复杂链式调用"
+                }
+                
+            reflexion_memory.append(reflection)
+
+    data_insights = captured_output.getvalue()
+    generated_charts = glob.glob(os.path.join(chart_dir, "chart_*.png"))
+
+    if execution_error:
+        error_html = f"<h2>⚠️ 数据分析中断</h2><pre>{execution_error}</pre>"
+        with open(report_out, "w", encoding="utf-8") as f: f.write(error_html)
+        return error_html, report_out, {} 
+
+    chart_status = f"生成的图表文件有：{[os.path.basename(c) for c in generated_charts]}。"
+
+    # ==========================================
+    # Node 3：🧑‍💼 终极分析师 Agent
+    # ==========================================
+    st.markdown("### 🧑‍💼 分析师 Agent 正在撰写最终多表融合洞察报告...")
+    analyst_prompt = ChatPromptTemplate.from_messages([("system", DA_ANALYST_SYSTEM), ("user", "原需求：{query}")])
+    final_markdown = ""
+    try:
+        raw_report = ""
+        report_placeholder = st.empty()
+        count = 0
+        for chunk in (analyst_prompt | llm_analyst).stream({
+            "analysis_plan": analysis_plan, "data_insights": data_insights,
+            "chart_status": chart_status, "query": user_query
+        }):
+            raw_report += chunk.content
+            count += 1
+            if count % 8 == 0: report_placeholder.markdown(raw_report + "▌")
+        report_placeholder.markdown(raw_report)
+            
+        match = re.search(r'<FINAL_REPORT>\s*(.*?)\s*</FINAL_REPORT>', raw_report, re.DOTALL)
+        final_markdown = match.group(1).strip() if match else raw_report.strip()
+    except Exception as e:
+        final_markdown = f"报告生成失败: {e}"
+
+    import shutil
+    for src in glob.glob(os.path.join(chart_dir, "chart_*.png")):
+        shutil.copy2(src, os.path.basename(src))
+
+    html_string = generate_html_report(final_markdown, report_out)
+    return html_string, report_out, {"plan": analysis_plan, "data": data_insights}
+
+# 追问模块 (无需改动)
+def run_followup_chat(user_query: str, chat_history: list, context_data: dict, api_key: str, api_base: str):
+    llm_chat = ChatOpenAI(temperature=0.4, model="deepseek-v3-0324", api_key=api_key, base_url=api_base)
+    messages = [("system", DA_FOLLOWUP_SYSTEM.format(data=context_data.get("data", "无数据")))]
+    for msg in chat_history: messages.append((msg["role"], msg["content"]))
+    messages.append(("user", user_query))
+    prompt = ChatPromptTemplate.from_messages(messages)
+    return (prompt | llm_chat).stream({})

@@ -10,6 +10,7 @@ from typing import List
 from datetime import datetime
 from langchain_openai import ChatOpenAI
 from core.paths import get_db_path, get_config_path
+from core.schemas import Text2SQLOutput
 
 # 引入向量库相关组件（FAISS 在本地运行，不需要外网）
 from langchain_community.vectorstores import FAISS        
@@ -32,23 +33,21 @@ os.environ['NO_PROXY'] = INTERNAL_URL
 
 
 # 【新增】：内网 Embedding 模型的配置
-# 如果内网 Embedding 接口和大模型是同一个地址，直接沿用即可；如果不同，请替换！
 EMBEDDING_API_BASE = INTERNAL_API_BASE 
 EMBEDDING_API_KEY = INTERNAL_API_KEY   
-EMBEDDING_MODEL_NAME = "bge-m3"  # 请确认你们内网 Embedding 模型的调用名称
+EMBEDDING_MODEL_NAME = "bge-m3"  
 
 from core.paths import get_db_path, get_upload_path, get_config_path
 DB_PATH = get_db_path("telecom_data.duckdb")
 LOG_PATH = get_upload_path("query_logs.csv")
 
 # ==========================================
-# 2. 自定义内网 Embedding 调用类（100% 免疫网络报错）
+# 2. 自定义内网 Embedding 调用类
 # ==========================================
 class IntranetEmbeddings(Embeddings):
     """自定义的 Embedding 类，纯 HTTP 请求，绝对不会触发本地下载和 tiktoken 校验"""
     def __init__(self, api_url: str, api_key: str, model_name: str):
         self.api_url = api_url.rstrip("/")
-        # 自动补全 OpenAI 标准的 embeddings 路径
         if not self.api_url.endswith("/embeddings"):
             self.api_url += "/embeddings" if self.api_url.endswith("/v1") else "/v1/embeddings"
         self.api_key = api_key
@@ -61,14 +60,12 @@ class IntranetEmbeddings(Embeddings):
         }
         payload = {"input": texts, "model": self.model_name}
         try:
-            # 发送数据到内网计算向量
             response = requests.post(self.api_url, json=payload, headers=headers, timeout=15)
             response.raise_for_status()
             data = response.json()
             return [item["embedding"] for item in data["data"]]
         except Exception as e:
             print(f"❌ 内网 Embedding API 调用失败: {e}")
-            # 即使失败也返回一个零向量，确保程序不会崩溃停止 (BGE-M3 通常是 1024 维)
             return [[0.0] * 1024 for _ in texts] 
 
     def embed_query(self, text: str) -> List[float]:
@@ -107,7 +104,6 @@ class VisualTelecomAnalyst:
             temperature=0.0  
         )
         
-        # 【新增】：初始化我们的纯净版内网 Embedding 模型
         self.embeddings = IntranetEmbeddings(
             api_url=EMBEDDING_API_BASE,
             api_key=EMBEDDING_API_KEY,
@@ -118,17 +114,12 @@ class VisualTelecomAnalyst:
             raise FileNotFoundError(f"找不到数据库 {DB_PATH}，请先运行 build_db.py！")
         self.con = duckdb.connect(DB_PATH, read_only=True)
         
-        # ==========================================
-        # 修复后的 YAML 读取逻辑
-        # ==========================================
         yaml_path = get_config_path("schema.yaml")
              
         try:
             with open(yaml_path, "r", encoding="utf-8") as f:
                 self.config = yaml.safe_load(f)
                 self.golden_sqls = self.config.get("golden_sqls", [])
-            # 【增加强提示】：在终端打印读取结果，防止静默失败
-            # print(f"✅ 成功从 {os.path.basename(yaml_path)} 读取了 {len(self.golden_sqls)} 条黄金案例！")
         except FileNotFoundError:
             print(f"❌ 严重警告：找不到任何 YAML 配置文件，AI 将失去参考记忆！")
             self.config = {}
@@ -138,22 +129,15 @@ class VisualTelecomAnalyst:
             self.config = {}
             self.golden_sqls = []
 
-        # 👇 【将旧的算向量代码替换为以下持久化极速版】：
         self.vector_store = None
         if self.golden_sqls:
-            # 定义本地向量库的存储路径 (存放到 global_data/databases/ 下)
             faiss_dir = get_db_path("telecom_golden_sql_faiss")
-            
             if os.path.exists(faiss_dir):
-                # ⚡ 极速模式：如果硬盘上已经有了，直接 0.01 秒秒读，不调 API！
-                # print("⚡ [无线问数] 极速命中本地 SQL 向量库缓存...")
                 self.vector_store = FAISS.load_local(faiss_dir, self.embeddings, allow_dangerous_deserialization=True)
             else:
-                # ⏳ 只有真正第一次运行，或者你删了缓存文件夹，才会去调模型算向量
                 print("⏳ [无线问数] 首次启动：正在调用内网模型计算 SQL 向量库...")
                 docs = [Document(page_content=item['question'], metadata={"sql": item['sql']}) for item in self.golden_sqls]
                 self.vector_store = FAISS.from_documents(docs, self.embeddings)
-                # 算完立刻存入硬盘，一劳永逸！
                 self.vector_store.save_local(faiss_dir)
 
     def get_real_schema(self):
@@ -165,28 +149,19 @@ class VisualTelecomAnalyst:
         return context
 
     def retrieve_golden_sqls(self, user_query, top_k=2):
-        """【恢复为高级向量检索】：使用 FAISS 在本地搜索最匹配的 SQL"""
         if not self.vector_store: return "无历史参考案例。"
-        
-        # 通过向量距离找到语义最相近的问题
         similar_docs = self.vector_store.similarity_search(user_query, k=top_k)
-        
         best_examples = ""
         for i, doc in enumerate(similar_docs):
             best_examples += f"[案例 {i+1}]\n问题: {doc.page_content}\nSQL: {doc.metadata['sql']}\n\n"
         return best_examples.strip()
 
     def get_latest_table(self, prefix="join_all_kpi_table_region"):
-        """扫描数据库，找到日期后缀最大的表名"""
         try:
-            # 获取所有表名
             tables = self.con.execute("SHOW TABLES").df()['name'].tolist()
-            # 筛选出符合前缀的表，并提取最后的数字进行排序
             target_tables = [t for t in tables if t.startswith(prefix)]
             if not target_tables:
-                return prefix + "202511"  # 如果没找到，返回一个默认值
-            
-            # 按名称排序，取最后一个（例如 202511 会排在 202510 后面）
+                return prefix + "202511" 
             latest_table = sorted(target_tables)[-1]
             return latest_table
         except Exception:
@@ -197,21 +172,46 @@ class VisualTelecomAnalyst:
         few_shot_examples = self.retrieve_golden_sqls(user_query)
         latest_kpi_table = self.get_latest_table()
         
-        # 包含了之前刚刚为你优化的 多维对比规则 和 并排查询规则
-        # 使用 .format() 动态注入变量
         system_prompt = NET_QUERY_SYSTEM_PROMPT.format(
             current_schema=current_schema,
             few_shot_examples=few_shot_examples,
             latest_kpi_table=latest_kpi_table
         )
 
+        # 👇 核心重构：绕过 API 限制，使用 LangChain 原生的 Pydantic 解析器！
+        from langchain_core.output_parsers import PydanticOutputParser
+        from core.schemas import Text2SQLOutput
+        
+        # 1. 初始化解析器
+        parser = PydanticOutputParser(pydantic_object=Text2SQLOutput)
+        
+        # 2. 拿到 Pydantic 自动生成的极其严密的 JSON 格式说明
+        format_instructions = parser.get_format_instructions()
+        
+        # 3. 把格式说明强行拼接到 System Prompt 的最后面，命令大模型遵守
+        system_prompt += f"\n\n【极其重要：输出格式要求】\n{format_instructions}"
+
         messages = [{"role": "system", "content": system_prompt}] + history + [{"role": "user", "content": user_query}]
-        # print(messages)
-        # print(self.llm.invoke(messages).content.strip())
-        # 👇【将原来直接 return 的代码替换为拦截器】：
+        
         with get_openai_callback() as cb:
-            result = self.llm.invoke(messages).content.strip()
-            # 计费入库 (利用 langchain 自带的精准统计)
+            # 4. 像以前一样，只请求普通的纯文本字符串，绝对不传 response_format 参数
+            raw_result_str = self.llm.invoke(messages).content.strip()
+            
+            # 计费入库
             log_usage("无线网络问数", "deepseek-v3-0324", cb.total_tokens)
             
-        return result
+            try:
+                # 5. 在本地用解析器将纯文本字符串转化为 Pydantic 对象！
+                result_obj = parser.invoke(raw_result_str)
+            except Exception as e:
+                print(f"❌ 大模型未按 JSON 格式输出，解析失败: {e}\n原文: {raw_result_str}")
+                # 终极兜底：如果大模型彻底发疯没输出 JSON，我们手动伪造一个对象返回，防止前端白屏
+                result_obj = Text2SQLOutput(
+                    thinking="解析失败，触发系统兜底保护机制。",
+                    sql="SELECT * FROM join_all_kpi_table_region202511 LIMIT 10;", 
+                    chart_type="none",
+                    chart_title="数据解析失败",
+                    comment="由于内网大模型未按照严格格式输出，触发安全兜底拦截。"
+                )
+                
+        return result_obj
