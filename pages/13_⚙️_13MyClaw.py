@@ -86,10 +86,36 @@ def call_llm_with_fallback(messages, tools=None, primary_model=None, fallback_mo
 # ==========================================
 def execute_bash(command: str) -> str:
     try:
-        # cwd 限定在工作区，相对安全
         result = subprocess.run(command, shell=True, cwd=WORKSPACE, capture_output=True, text=True, timeout=120)
-        return (result.stdout + "\n" + result.stderr).strip() or "执行成功，无输出。"
+        output = (result.stdout + "\n" + result.stderr).strip() or "执行成功，无输出。"
+        # 【优化】：防止日志太长撑爆 Token，截取最后 4000 个字符
+        if len(output) > 4000:
+            output = "...[前文已省略]...\n" + output[-4000:]
+        return output
     except Exception as e: return f"终端崩溃: {str(e)}"
+
+def delegate_to_coder(filepath: str, task_description: str) -> str:
+    sys_prompt = "你是底层算法架构师。只输出独立可运行的 Python 代码，绝对不要任何 Markdown 标记或多余的解释。如果涉及读写，注意编码(utf-8)。"
+    try:
+        msg = call_llm_with_fallback(
+            messages=[{"role": "system", "content": sys_prompt}, {"role": "user", "content": f"目标路径: {filepath}\n严苛需求:\n{task_description}"}],
+            primary_model=c_model,
+            fallback_models=[fallback_1, fallback_2, b_model], 
+            temperature=0.1
+        )
+        code_content = msg.content.replace("```python", "").replace("```", "").strip()
+        
+        safe_path = os.path.abspath(os.path.join(WORKSPACE, filepath))
+        if not safe_path.startswith(os.path.abspath(WORKSPACE)):
+            return "❌ 代码注入越权拦截：禁止在工作区外写入文件！"
+            
+        # 【优化】：自动创建可能缺失的子目录，防止 FileNotFoundError
+        os.makedirs(os.path.dirname(safe_path), exist_ok=True)
+            
+        with open(safe_path, 'w', encoding='utf-8') as f: f.write(code_content)
+        return f"👨‍💻 Coder 已成功构建代码并保存至 {filepath}。Brain，请务必用 execute_bash 执行代码并检查结果。"
+    except Exception as e: return f"Coder 脑力过载: {str(e)}"
+
 
 def read_file(filepath: str) -> str:
     try:
@@ -115,24 +141,6 @@ def append_memory(lesson: str) -> str:
         return f"✅ 认知升级完毕，经验已刻入: {lesson}"
     except Exception as e: return f"记忆刻录失败: {str(e)}"
 
-def delegate_to_coder(filepath: str, task_description: str) -> str:
-    sys_prompt = "你是底层算法架构师。只输出独立可运行的 Python 代码，绝对不要任何 Markdown 标记或多余的解释。如果涉及读写，注意编码(utf-8)。"
-    try:
-        msg = call_llm_with_fallback(
-            messages=[{"role": "system", "content": sys_prompt}, {"role": "user", "content": f"目标路径: {filepath}\n严苛需求:\n{task_description}"}],
-            primary_model=c_model,
-            fallback_models=[fallback_1, fallback_2, b_model], 
-            temperature=0.1
-        )
-        code_content = msg.content.replace("```python", "").replace("```", "").strip()
-        
-        safe_path = os.path.abspath(os.path.join(WORKSPACE, filepath))
-        if not safe_path.startswith(os.path.abspath(WORKSPACE)):
-            return "❌ 代码注入越权拦截：禁止在工作区外写入文件！"
-            
-        with open(safe_path, 'w', encoding='utf-8') as f: f.write(code_content)
-        return f"👨‍💻 Coder 已成功构建代码并保存至 {filepath}。Brain，请务必用 execute_bash 执行代码并检查结果。"
-    except Exception as e: return f"Coder 脑力过载: {str(e)}"
 
 def ask_vision(image_filename: str, question: str) -> str:
     if not v_model: return "视觉神经未接入 (模型为空)。"
@@ -176,7 +184,7 @@ tools = [
 # 4. Streamlit UI: 万能工作坞站
 # ==========================================
 st.set_page_config(page_title="ZClaw 智能执行器", page_icon="⚙️", layout="wide")
-st.title("⚙️ ZClaw: 自主重试与代理执行引擎")
+st.title("⚙️ ZClaw: 小小小龙虾")
 
 with st.sidebar:
     st.header("📂 物理数据坞站 (沙盒模式)")
@@ -194,26 +202,28 @@ with st.sidebar:
     st.info(f"👁️ **Vision 视觉**:\n{v_model or '未配置'}")
 
 # ==========================================
-# 5. 方法论核心与无限循环引擎 (Actor-Critic 裁判机制)
+# 5. 方法论核心与无限循环引擎 (带记忆热更新)
 # ==========================================
-with open(MEMORY_FILE, 'r', encoding='utf-8') as f: current_memory = f.read()
+def get_system_prompt():
+    """每次调用时实时读取最新记忆，保证热更新"""
+    with open(MEMORY_FILE, 'r', encoding='utf-8') as f: 
+        current_memory = f.read()
 
-system_prompt = f"""You are an autonomous AI software engineer.
-Your secure workspace directory is `{WORKSPACE}`. All file operations should be relative to this directory.
+    return f"""You are ZClaw, an autonomous AI engineer. Your secure workspace is `{WORKSPACE}`.
 
-【Your Memory】:
+【Your Long-term Memory (Rules & Lessons)】:
 {current_memory}
 
 【Directives】:
-1. You have tools to interact with the system. Use them to explore the environment, write code, run tests, and browse the web.
-2. The user will give you a high-level goal. You must figure out the step-by-step implementation.
-3. If you face an error, debug it autonomously.
-4. Keep trying until the goal is fully achieved. 
-5. Think out loud before you act.
+1. Environment: Explore before acting. Don't guess file structures or contents.
+2. Coding: ALWAYS use `delegate_to_coder` to write Python scripts to `.py` files. Never save code to `.txt` or data files.
+3. Errors: If you face an error, debug it autonomously. DO NOT give up easily.
+4. Validation: Verify output files exist and contain real data before declaring success.
+5. 🌟 Long-term Learning (CRITICAL): If the user scolds you, corrects your mistakes, or provides a new rule, you MUST immediately call the `append_memory` tool to save the lesson into your Long-term Memory permanently!
 """
 
 if "zclaw_messages" not in st.session_state:
-    st.session_state.zclaw_messages = [{"role": "system", "content": system_prompt}]
+    st.session_state.zclaw_messages = [{"role": "system", "content": get_system_prompt()}]
 if "zclaw_history" not in st.session_state: 
     st.session_state.zclaw_history = []
 
@@ -222,15 +232,18 @@ for msg in st.session_state.zclaw_history:
     with st.chat_message(msg["role"]): 
         st.markdown(msg["content"])
 
-# 接收新任务
-if prompt := st.chat_input("向中枢下发模糊任务 (例：帮我写个爬虫抓取XX网首页)..."):
+# 接收新任务/或者用户的骂声
+if prompt := st.chat_input("向中枢下发任务或指出它的错误..."):
+    # 🌟 【记忆热更新】：每次用户发话前，强制刷新 System Prompt，这样它刚存的记忆立刻生效！
+    st.session_state.zclaw_messages[0]["content"] = get_system_prompt()
+
     st.chat_message("user").markdown(prompt)
     st.session_state.zclaw_history.append({"role": "user", "content": prompt})
     st.session_state.zclaw_messages.append({"role": "user", "content": prompt})
 
     with st.chat_message("assistant"):
         status = st.status("🚀 中枢全功率运转，调度计算资源...", expanded=True)
-        
+        # ... (下方保留你原有的 MAX_STEPS 循环代码) ...
         MAX_STEPS = 100 
         for step in range(MAX_STEPS):
             status.update(label=f"🔄 深度反思与执行审查 (第 {step + 1}/{MAX_STEPS} 轮)...", state="running")
