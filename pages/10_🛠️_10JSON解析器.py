@@ -1,6 +1,7 @@
 # pages/10_🛠️_JSON解析器.py
 import streamlit as st
 import json
+import re  # 仅新增这一行用于后续的正则提取
 from core.settings import settings
 from core.token_tracker import log_usage
 from langchain_openai import ChatOpenAI
@@ -53,41 +54,49 @@ with col2:
     # -----------------------------------------
     if btn_ai:
         if raw_input.strip():
-            with st.spinner("🧠 正在调动 AI 理解层级，清洗不规范字符..."):
-                
-                # ✅ 修复：在此处预先定义 result，防止 try 内部崩溃时 except 找不到变量
-                result = "（API 调用失败或未返回结果）" 
-                
-                try:
-                    prompt = ChatPromptTemplate.from_template(JSON_CLEANER_PROMPT)
-                    llm = get_llm(model_name=settings.MODEL_TEXT, temperature=0)
+            # ⬇️ 这里开始是本次修改的核心部分 ⬇️
+            st.info("🧠 正在调动 AI 理解层级，清洗不规范字符，请观察下方实时输出...")
+            
+            # 创建占位符，用来实时显示打字机效果
+            stream_container = st.empty() 
+            result = "" 
+            
+            try:
+                prompt = ChatPromptTemplate.from_template(JSON_CLEANER_PROMPT)
+                llm = get_llm(model_name=settings.MODEL_TEXT, temperature=0)
 
-                    with get_openai_callback() as cb:
-                        result = (prompt | llm).invoke({"text": raw_input}).content.strip()
-                        
-                        # ⚠️ 核心修复：用巧妙的字符串拼接避开前端 Markdown 渲染器崩溃的 Bug
-                        md_marker = "`" * 3
-                        if result.startswith(md_marker + "json"):
-                            result = result[7:]
-                        if result.startswith(md_marker):
-                            result = result[3:]
-                        if result.endswith(md_marker):
-                            result = result[:-3]
-                            
+                with get_openai_callback() as cb:
+                    # 改动 1：使用 stream() 替代 invoke()，实现流式输出
+                    for chunk in (prompt | llm).stream({"text": raw_input}):
+                        result += chunk.content
+                        stream_container.code(result + "▌", language="json")
+                    
+                    # 运行完毕后清空占位符的光标和文本
+                    stream_container.empty()
+                    
+                    # 改动 2：使用 chr(96) 动态生成反引号，配合正则精准提取，彻底避开前端崩溃 Bug
+                    md_marker = chr(96) * 3
+                    pattern = rf"{md_marker}(?:json)?(.*?){md_marker}"
+                    match = re.search(pattern, result, re.DOTALL | re.IGNORECASE)
+                    
+                    if match:
+                        result = match.group(1).strip()
+                    else:
                         result = result.strip()
-                        
-                        parsed_json = json.loads(result)
-                        st.success("🎉 AI 清洗重构成功！")
-                        st.json(parsed_json, expanded=True)
-                        
-                        # 计费拦截
-                        tokens = cb.total_tokens
-                        if tokens == 0:
-                            tokens = int((len(raw_input) + len(result)) * 1.2)
-                        log_usage("JSON智能清洗", settings.MODEL_TEXT, tokens)
-                        
-                except Exception as e:
-                    # 现在这里调用 {result} 就绝对安全了
-                    st.error(f"❌ AI 解析失败: {e}\n\n可能数据结构过于混乱，AI 返回的原文如下:\n{result}")
+                    
+                    parsed_json = json.loads(result)
+                    st.success("🎉 AI 清洗重构成功！")
+                    st.json(parsed_json, expanded=True)
+                    
+                    # 计费拦截 (原封不动保留)
+                    tokens = cb.total_tokens
+                    if tokens == 0:
+                        tokens = int((len(raw_input) + len(result)) * 1.2)
+                    log_usage("JSON智能清洗", settings.MODEL_TEXT, tokens)
+                    
+            except Exception as e:
+                # 异常处理原封不动保留，仅为了安全把大括号内的 result 去掉了自带的 Markdown 标记
+                st.error(f"❌ AI 解析失败: {e}\n\n可能数据结构过于混乱，AI 返回的原文如下:\n{result}")
+            # ⬆️ 核心改动结束 ⬆️
         else:
             st.warning("请输入要解析的内容。")

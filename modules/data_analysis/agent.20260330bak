@@ -19,9 +19,6 @@ from typing import TypedDict, List, Dict, Literal
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
 
-import ast          # [新增] Harness 静态代码检查
-import traceback    # [新增] Harness 完整堆栈捕获
-
 import core.paths
 from modules.data_analysis.reporter import generate_html_report
 from core.schemas import CodeReflection
@@ -29,71 +26,6 @@ from core.prompts import (
     DA_PLANNER_SYSTEM, DA_CODER_SYSTEM, DA_REFLECT_SYSTEM, 
     DA_ANALYST_SYSTEM, DA_FOLLOWUP_SYSTEM
 )
-
-# ==========================================
-# [新增] Harness Engineering: 代码执行保护带沙箱
-# ==========================================
-class CodeExecutionHarness:
-    """
-    AI 代码执行保护带 (Harness)
-    负责：静态语法检查、危险代码拦截、安全沙箱执行、丰富错误堆栈捕获
-    """
-    def __init__(self):
-        # 定义绝对不允许 AI 调用的高危系统指令
-        self.forbidden_calls = ['system', 'popen', 'rmdir', 'remove', 'eval', 'exec']
-
-    def pre_flight_check(self, code: str) -> str:
-        """执行前的 AST 静态检查，提前拦截低级错误和危险操作"""
-        try:
-            tree = ast.parse(code)
-        except SyntaxError as e:
-            return f"SyntaxError (代码存在基本语法错误): {e.msg} at line {e.lineno}"
-        
-        # 扫描危险调用
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Call):
-                if isinstance(node.func, ast.Name) and node.func.id in self.forbidden_calls:
-                    return f"SecurityError: Harness 拦截到被禁止的系统级函数调用 `{node.func.id}`，请修改代码仅进行数据处理。"
-                elif isinstance(node.func, ast.Attribute) and node.func.attr in self.forbidden_calls:
-                     return f"SecurityError: Harness 拦截到危险属性调用 `{node.func.attr}`。"
-        return "" # 静态检查通过
-
-    def execute(self, code: str, dfs: dict) -> tuple[str, str]:
-        """
-        受控执行代码，返回 (标准输出字符串, 错误日志字符串)
-        """
-        # 第一道防线：静态检查
-        static_error = self.pre_flight_check(code)
-        if static_error:
-            return "", static_error
-            
-        first_df_name = list(dfs.keys())[0] if dfs else None
-        captured_output = io.StringIO()
-        
-        # 准备受限的全局环境
-        exec_env = {
-            "dfs": dfs, 
-            "df": dfs[first_df_name] if first_df_name else None, 
-            "pd": pd, 
-            "os": os, 
-            "re": re,
-            "__builtins__": __builtins__
-        }
-        
-        # 第二道防线：捕获执行过程中的深层异常并截取堆栈
-        try:
-            import matplotlib
-            matplotlib.use("Agg") # 强制无头模式
-            with redirect_stdout(captured_output):
-                exec(code, exec_env)
-            return captured_output.getvalue(), ""
-        except Exception as e:
-            tb_str = traceback.format_exc()
-            # 取最后 15 行堆栈，避免给 AI 传入过多无用 token
-            lines = tb_str.split('\n')
-            short_tb = '\n'.join(lines[-15:]) if len(lines) > 15 else tb_str
-            error_msg = f"运行时异常 {type(e).__name__}: {str(e)}\n\n--- Harness 捕获到的详细堆栈 ---\n{short_tb}"
-            return captured_output.getvalue(), error_msg
 
 # ==========================================
 # 0. 自动生成洞察机制 (Auto Insights) - 已修复转义
@@ -133,6 +65,7 @@ def run_auto_insights(dfs: dict, api_key: str, api_base: str) -> dict:
         return {
             "summary": f"数据已就绪。自动画像生成遇到一点小问题，您可以手动输入分析需求。", 
             "questions": [ "概括数据的核心指标", "绘制主要业务的趋势","分析数据分布与关系"]
+
         }
 
 # ==========================================
@@ -191,7 +124,7 @@ def node_coder(state: AgentState) -> dict:
     memory_str = "无历史报错，首次尝试。"
     if state["reflections"]:
         memory_str = "\n".join([
-            f"【第{m['attempt']}次尝试 Harness 反馈】\n  报错: {m['error']}\n  对策: {m['fix_strategy']}"
+            f"【第{m['attempt']}次失败反思】\n  报错: {m['error']}\n  对策: {m['fix_strategy']}"
             for m in state["reflections"]
         ])
 
@@ -212,7 +145,7 @@ def node_coder(state: AgentState) -> dict:
             count += 1
             if count % 8 == 0: code_placeholder.markdown(f"```python\n{raw_code}▌\n```")
         code_placeholder.markdown(f"```python\n{raw_code}\n```")
-        st.info("⚙️ 代码接收完毕，准备丢入 Harness 沙箱执行...")
+        st.info("⚙️ 代码接收完毕，准备执行...")
     except Exception as e:
         st.error(f"API请求异常: {e}")
 
@@ -242,25 +175,34 @@ def node_coder(state: AgentState) -> dict:
     return {"generated_code": agg_prefix + clean_code}
 
 def node_executor(state: AgentState) -> dict:
-    st.markdown("### 🛡️ Harness 沙箱验证与运行代码中...")
+    code = state["generated_code"]
+    dfs = state["dfs"]
+    first_df_name = list(dfs.keys())[0] if dfs else None
     
-    # [改造点] 实例化 Harness 保护带
-    harness = CodeExecutionHarness()
-    stdout_logs, error_msg = harness.execute(state["generated_code"], state["dfs"])
+    captured_output = io.StringIO()
+    error_msg = ""
     
-    if not error_msg:
-        charts_found = glob.glob(os.path.join(state["chart_dir"], "chart_*.png"))
-        if stdout_logs.strip() or charts_found:
-            st.success(f"✅ Harness 验证通过！代码执行成功！共生成图表: {len(charts_found)} 张")
-        else:
-            st.warning("⚠️ Harness 提示：代码执行成功，但未输出任何分析数据，且未生成图片！")
-    else:
-        st.error("❌ Harness 拦截到异常！已抓取堆栈日志并准备抛回给 AI 进行反思...")
-        with st.expander("查看详细报错", expanded=False):
-            st.code(error_msg)
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as _plt
+        
+        exec_env = {"dfs": dfs, "df": dfs[first_df_name] if first_df_name else None, "pd": pd, "os": os, "re": re}
+        with redirect_stdout(captured_output):
+            exec(code, exec_env)
             
+        charts_found = glob.glob(os.path.join(state["chart_dir"], "chart_*.png"))
+        captured_preview = captured_output.getvalue().strip()
+        if captured_preview or charts_found:
+            st.success(f"✅ 代码执行成功！共生成图表: {len(charts_found)} 张")
+        else:
+            st.warning("⚠️ 代码未输出任何分析数据，且未生成图片！")
+    except Exception as e:
+        error_msg = str(e)
+        st.error(f"❌ 执行报错：{error_msg}")
+        
     return {
-        "execution_logs": stdout_logs,
+        "execution_logs": captured_output.getvalue(),
         "error_msg": error_msg,
         "attempt": state["attempt"] + 1
     }

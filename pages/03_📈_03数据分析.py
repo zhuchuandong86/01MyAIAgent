@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 import core.paths  
 from core.token_tracker import log_usage
 from langchain_community.callbacks.manager import get_openai_callback
-from modules.data_analysis.agent import run_agent_pipeline, run_followup_chat
+from modules.data_analysis.agent import run_agent_pipeline, run_followup_chat, run_auto_insights
 
 load_dotenv(core.paths.ENV_FILE)
 API_KEY = os.getenv("INTERNAL_API_KEY")
@@ -17,7 +17,7 @@ MODEL_NAME = os.getenv("MODEL_TEXT", "deepseek-v3-0324")
 st.set_page_config(page_title="AI 数据分析终端", page_icon="📈", layout="wide")
 
 st.title("📈 智能数据分析与洞察终端")
-st.markdown("支持**多文件上传**与**Excel多Sheet并发读取**，AI将自动进行跨表关联与全面洞察。")
+st.markdown("支持**多文件上传**与**Excel多Sheet并发读取**，AI将自动进行跨表关联与全面洞察。如文件较大，刚上传后可能略慢")
 
 if 'da_report_html' not in st.session_state:
     st.session_state.da_report_html = None
@@ -27,18 +27,17 @@ if 'da_context_data' not in st.session_state:
     st.session_state.da_context_data = None
 if 'da_chat_history' not in st.session_state:
     st.session_state.da_chat_history = []
+if 'quick_query' not in st.session_state:
+    st.session_state.quick_query = ""
 
+# 侧边栏仅保留上传功能，体验更清爽
 with st.sidebar:
-    st.header("1. 上传数据")
+    st.header("1. 📂 上传数据")
     uploaded_files = st.file_uploader(
         "支持 CSV 或 Excel 文件 (可多选)", 
         type=['csv', 'xlsx', 'xls'], 
         accept_multiple_files=True
     )
-    
-    st.header("2. 分析需求 (可选)")
-    user_query = st.text_area("请输入您的具体关注点...", placeholder="例如：将销售表和省份表关联起来，分析各省业绩。")
-    analyze_btn = st.button("🚀 开始智能分析", type="primary")
 
 if uploaded_files:
     all_dfs = {}
@@ -62,20 +61,56 @@ if uploaded_files:
         st.stop()
         
     st.write("### 📂 分析范围确认")
-    # 👇 核心改进：使用 multiselect 并默认全选所有加载出来的表
     selected_dataset_names = st.multiselect(
         "已自动解析以下表单，**默认全部进行联合分析**。您可以手动取消不需要的表：", 
         list(all_dfs.keys()),
-        default=list(all_dfs.keys()) # 默认全选
+        default=list(all_dfs.keys()) 
     )
     
     if not selected_dataset_names:
         st.warning("请至少保留一个表格用于分析！")
         st.stop()
         
-    # 组装最终需要送给大模型的字典
     target_dfs = {name: all_dfs[name] for name in selected_dataset_names}
     st.success(f"✅ 准备就绪，共将 {len(target_dfs)} 张表送入 AI 分析引擎。")
+
+    # =========================================================
+    # 【新增】核心模块：自动生成数据画像与洞察
+    # =========================================================
+    file_hash = "-".join(sorted(list(target_dfs.keys())))
+    if 'current_file_hash' not in st.session_state or st.session_state.current_file_hash != file_hash:
+        st.session_state.current_file_hash = file_hash
+        st.session_state.auto_insights = None
+        st.session_state.quick_query = ""
+        
+    if not st.session_state.auto_insights and API_KEY:
+        with st.spinner("🤖 正在全自动对数据进行扫描与画像生成 (Auto-Profiling)..."):
+            st.session_state.auto_insights = run_auto_insights(target_dfs, API_KEY, API_BASE)
+
+    if st.session_state.auto_insights:
+        insights = st.session_state.auto_insights
+        with st.container(border=True):
+            st.markdown("### ✨ AI 数据初探画像")
+            st.info(insights.get("summary", "AI 正在思考中..."))
+            
+            st.markdown("💡 **您可以直接点击以下推荐方向开启深度分析：**")
+            cols = st.columns(3)
+            for i, q in enumerate(insights.get("questions", [])):
+                if cols[i].button(f"🔍 {q}", key=f"btn_q_{i}", use_container_width=True):
+                    st.session_state.quick_query = q
+                    st.rerun()
+
+    # =========================================================
+    # 核心分析触发区 (移到了主界面，体验更好)
+    # =========================================================
+    st.markdown("---")
+    st.markdown("### 🎯 设定分析目标 (或直接点击上方推荐)")
+    user_query = st.text_area(
+        "请输入您的具体关注点...", 
+        value=st.session_state.quick_query, 
+        placeholder="例如：将销售表和省份表关联起来，分析各省业绩。"
+    )
+    analyze_btn = st.button("🚀 开始智能分析", type="primary")
 
     if analyze_btn:
         if not API_KEY:
@@ -84,12 +119,11 @@ if uploaded_files:
             
         with st.status(f"🤖 Multi-Agent 正在对 {len(target_dfs)} 张表进行联合思考与代码编写...", expanded=True) as status:
             with get_openai_callback() as cb:
-                # 传入的是一个字典 target_dfs
                 html_content, report_path, context_data = run_agent_pipeline(target_dfs, user_query, API_KEY, API_BASE)
                 
                 tokens = cb.total_tokens
                 if tokens == 0:
-                    tokens = 8000 # 多表模式耗费较大，基础兜底
+                    tokens = 8000 
                 log_usage("数据分析-多表模式", MODEL_NAME, tokens)
             
             status.update(label="✅ 跨表数据分析流执行完毕！(点击展开查看代码与报错排查史)", state="complete", expanded=False)
@@ -102,7 +136,7 @@ else:
     st.info("👈 请先在左侧上传数据文件。")
 
 # ==============================================================
-# 报告渲染与追问模块 (保持不变)
+# 报告渲染与追问模块 (原封不动保留)
 # ==============================================================
 if st.session_state.da_report_html:
     st.success("✅ 分析完成！")

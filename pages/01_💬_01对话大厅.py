@@ -1,7 +1,11 @@
-# pages/12_💬_双核对话大厅.py
+# pages/01_💬_01对话大厅.py
 import streamlit as st
 import sqlite3
 import os
+import tempfile
+import pandas as pd
+import json
+import re
 from datetime import datetime
 from core.settings import settings
 from core.token_tracker import log_usage
@@ -10,203 +14,227 @@ from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain_community.callbacks.manager import get_openai_callback
 import core.paths
 
-st.set_page_config(page_title="双核对话大厅", page_icon="💬", layout="wide")
+# 👇 引入真实底层引擎
+from modules.data_analysis.agent import run_agent_pipeline
+from core.parsers.document_engine import smart_parse_document
+from modules.rag.query_service import build_query_chain, format_docs
+
+st.set_page_config(page_title="通用智能大管家", page_icon="🤖", layout="wide")
 
 # ==========================================
-# 1. 数据库设置 (长短期平行记忆隔离引擎)
+# 0. 初始化全局工作区
+# ==========================================
+if "workspace_dir" not in st.session_state:
+    st.session_state.workspace_dir = tempfile.mkdtemp(prefix="agent_workspace_")
+
+# ==========================================
+# 1. 纯手工打造：硬核工具箱 (已移除查时间工具)
+# ==========================================
+def analyze_workspace_data(query: str = "综合分析", **kwargs) -> str:
+    """真实数据分析与画图工具"""
+    workspace = st.session_state.workspace_dir
+    dfs = {}
+    for f in os.listdir(workspace):
+        if f.endswith(('.csv', '.xlsx', '.xls')):
+            try:
+                if f.endswith('.csv'): dfs[f] = pd.read_csv(os.path.join(workspace, f))
+                else: dfs[f] = pd.read_excel(os.path.join(workspace, f))
+            except Exception as e:
+                return f"文件 {f} 读取失败: {str(e)}"
+                
+    if not dfs:
+        return "【失败】工作区内没有任何表格。请提示用户先上传数据文件。"
+
+    try:
+        html_string, report_out, context_data = run_agent_pipeline(
+            dfs=dfs, user_query=query, api_key=settings.API_KEY, api_base=settings.API_BASE
+        )
+        return f"【成功】底层执行日志：\n{context_data.get('data', '无')}\n请告诉用户底层图表状态机已跑通并生成结果。"
+    except Exception as e:
+        return f"【报错】底层数据引擎异常：{str(e)}"
+
+def read_workspace_document(file_name: str, query: str = "提取核心内容", **kwargs) -> str:
+    """真实单文档深度解析引擎 (带智能MD缓存)"""
+    workspace = st.session_state.workspace_dir
+    file_path = os.path.join(workspace, file_name)
+    
+    if not os.path.exists(file_path):
+        return f"【失败】找不到文件 {file_name}，请确认用户是否已上传。"
+        
+    try:
+        docs = smart_parse_document(file_path)
+        if not docs:
+            return f"【失败】未能从 {file_name} 中提取有效文本。"
+            
+        full_content = "\n".join([doc.page_content for doc in docs])
+        truncated_content = full_content[:15000] # 截断保护
+        suffix = "\n\n...(截断)" if len(full_content) > 15000 else ""
+        
+        return f"【文件 {file_name} 真实读取成功】：\n{truncated_content}{suffix}\n\n请严格基于此内容回答：{query}"
+    except Exception as e:
+        return f"【解析报错】：{str(e)}"
+
+def search_knowledge_base(query: str, **kwargs) -> str:
+    """真实企业 RAG 检索引擎 (财报级强溯源)"""
+    try:
+        _, retriever = build_query_chain()
+        source_docs = retriever.invoke(query)
+        
+        if not source_docs:
+            return f"在企业全局知识库中未能检索到与 '{query}' 相关的信息。"
+            
+        real_rag_result = format_docs(source_docs)
+        return f"【知识库真实检索成功】：\n{real_rag_result}\n\n请严格使用以上检索到的数据回答用户问题，并在回答的关键数据后，保留 [1] [2] 这种溯源角标！"
+    except FileNotFoundError:
+        return "【失败】找不到知识库索引文件。请告诉用户需要先去『06_RAG检索』页面入库文档。"
+    except Exception as e:
+        return f"【RAG 报错】：{str(e)}"
+
+def search_internet(query: str, **kwargs) -> str:
+    """真实全网搜索引擎 (带企业内网防崩溃隔离)"""
+    try:
+        from langchain_community.tools import DuckDuckGoSearchRun
+        search = DuckDuckGoSearchRun()
+        
+        safe_query = query[:50] 
+        result = search.invoke(safe_query)
+        
+        if not result or "No good DuckDuckGo Search Result was found" in result:
+            return f"【互联网检索失败】：未能找到关于 '{query}' 的有效信息。"
+            
+        return f"【互联网真实检索成功】：\n{result}\n\n请严格整理上述网络最新信息来回答用户，标注信息来源于互联网。"
+        
+    except ImportError:
+        return "【系统致命错误】：缺少 duckduckgo-search 库，请管理员在服务器运行 pip install duckduckgo-search"
+    except Exception as e:
+        error_msg = str(e)
+        if "Timeout" in error_msg or "ProxyError" in error_msg or "SSLError" in error_msg:
+            return "【网络拦截警告】：请求被企业内网防火墙或代理拦截。请告诉用户当前处于内网环境，无法访问外部互联网。"
+        return f"【搜索组件异常】：{error_msg}"
+
+AVAILABLE_TOOLS = {
+    "analyze_workspace_data": analyze_workspace_data,
+    "read_workspace_document": read_workspace_document,
+    "search_knowledge_base": search_knowledge_base,
+    "search_internet": search_internet
+}
+
+# 🌟 大管家最高指令法则基座 (去掉了时间工具)
+SUPERVISOR_SYSTEM_PROMPT_BASE = """你是一个极其专业的企业级全能AI大管家。你有能力自主思考，并调用系统工具来辅助回答用户。
+
+【可用工具库】
+1. name: analyze_workspace_data
+   args: {"query": "用户的具体分析需求"}
+2. name: read_workspace_document
+   args: {"file_name": "完整的文件名带后缀", "query": "用户的疑问"}
+3. name: search_knowledge_base
+   description: 当询问公司规章、财报、历史资料时检索全局库。
+   args: {"query": "提炼出的精准搜索关键词"}
+4. name: search_internet
+   description: 当用户询问当下的实时新闻、外部公开信息、或超出你知识库范围的外部问题时，调用此工具去公网搜索。
+   args: {"query": "提取出的核心搜索关键词"}
+
+【执行规范】(最高优先级)
+如果你决定调用工具，必须且只能输出如下 XML 结构，禁止输出其他废话：
+<tool_call>
+{"name": "工具名", "args": {"参数名": "参数值"}}
+</tool_call>
+
+如果已经收到【系统通知：工具执行结果】，请直接用优美的排版回答用户，**并务必保留检索结果中的 [1] [2] 等来源角标**！
+"""
+
+# ==========================================
+# 2. 数据库与记忆引擎
 # ==========================================
 DB_PATH = core.paths.get_db_path("chat_memory.db")
-
 def init_db():
     with sqlite3.connect(DB_PATH) as conn:
-        conn.execute('''
-            CREATE TABLE IF NOT EXISTS dual_chat_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id TEXT,
-                track TEXT,     -- 取值为 'USER', 'A', 'B'
-                role TEXT,      -- 取值为 'user', 'assistant'
-                content TEXT,
-                timestamp DATETIME
-            )
-        ''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS dual_chat_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, track TEXT, 
+            role TEXT, content TEXT, timestamp DATETIME)''')
 init_db()
 
-def get_history(user_id, track, limit=10):
-    """
-    获取指定用户、指定脑区(左/右)的对话记忆。
-    确保 A 模型不会读取到 B 模型的历史回复，防止人格分裂。
-    """
+def get_history(user_id, limit=10):
     with sqlite3.connect(DB_PATH) as conn:
-        query = '''
-            SELECT role, content FROM dual_chat_history 
-            WHERE user_id = ? AND (track = 'USER' OR track = ?)
-            ORDER BY id ASC
-        '''
-        df = conn.execute(query, (user_id, track)).fetchall()
-        # limit 代表携带的轮数 (一轮包含 user+assistant 2条)，所以乘 2
-        return df[-(limit * 2):] if limit else df
+        query = "SELECT role, content FROM dual_chat_history WHERE user_id = ? AND track = 'SUPERVISOR' ORDER BY id ASC"
+        return conn.execute(query, (user_id,)).fetchall()[-(limit * 2):] if limit else conn.execute(query, (user_id,)).fetchall()
 
-def save_message(user_id, track, role, content):
-    """持久化保存至长期记忆库"""
+def save_message(user_id, role, content):
     with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            "INSERT INTO dual_chat_history (user_id, track, role, content, timestamp) VALUES (?, ?, ?, ?, ?)",
-            (user_id, track, role, content, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-        )
-
-def clear_memory(user_id):
-    """清除指定用户的长期记忆"""
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("DELETE FROM dual_chat_history WHERE user_id = ?", (user_id,))
+        conn.execute("INSERT INTO dual_chat_history (user_id, track, role, content, timestamp) VALUES (?, 'SUPERVISOR', ?, ?, ?)",
+            (user_id, role, content, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
 
 # ==========================================
-# 2. 侧边栏与身份识别
+# 3. 侧边栏：Agent 物理工作区
 # ==========================================
 with st.sidebar:
     st.header("👤 身份与记忆隔离")
-    st.info("💡 输入的 ID，继承历史对话。")
-    # 模拟 IP 或用户隔离，让用户自己指定身份标识
-    user_id = st.text_input("您的专属身份 ID (User ID)", value="Guest_01")
+    user_id = st.text_input("专属身份 ID", value="Admin_01")
+    model_name = st.text_input("🧠 核心调度模型", value=settings.MODEL_TEXT or "deepseek-v3-0324")
     
-    st.header("⚙️ 双核引擎配置")
-    model_a = st.text_input("🔵 左脑模型 (Model A)", value=settings.MODEL_TEXT or "deepseek-v3-0324")
-    model_b = st.text_input("🔴 右脑模型 (Model B)", value=settings.MODEL_RED or "qwen2.5-72b-instruct")
-    
-    memory_limit = st.slider("🧠 短期记忆携带轮数", min_value=0, max_value=50, value=10, help="传给大模型的上下文轮数。设为0则每次都是全新对话。")
-    
-    if st.button("🧹 清空该 ID 的所有记忆", use_container_width=True):
-        clear_memory(user_id)
-        st.toast("✅ 记忆已彻底清除！")
-        st.rerun()
-
-st.title("💬 双核记忆对话大厅 (A/B Test)")
-st.markdown("设定专属背景，输入问题，**双模型同时作答**，且各自拥有平行的上下文记忆线！基于您的 User ID 实现长短期记忆隔离。")
+    st.divider()
+    st.header("📥 Agent 工作区 (大管家视界)")
+    uploaded_files = st.file_uploader("支持文档与表格", accept_multiple_files=True, type=['csv', 'xlsx', 'xls', 'pdf', 'docx', 'txt'])
+    if uploaded_files:
+        for uf in uploaded_files:
+            with open(os.path.join(st.session_state.workspace_dir, uf.name), "wb") as f:
+                f.write(uf.getbuffer())
+        st.success(f"已载入 {len(uploaded_files)} 个文件入工作区！")
 
 # ==========================================
-# 3. 顶部：背景设定 (System Prompt)
+# 4. 主干逻辑：ReAct 循环引擎 (带动态时间注入)
 # ==========================================
-with st.expander("🎭 设定全局背景 / System Prompt (留空则为标准对话)", expanded=True):
-    sys_prompt = st.text_area(
-        "告诉模型它扮演什么角色或遵循什么规则：", 
-        placeholder="例如：你是一个精通 Python 的架构师；或者你是一个严厉的高中老师，只能用文言文回答...", 
-        height=80
-    )
+st.title("🤖 商业级全能大管家")
+st.markdown("通过 Prompt 物理引擎重构的通用智能体，已挂载**真实分析引擎**、**RAG知识库**与**公网搜索**。")
 
-st.divider()
+history = get_history(user_id, limit=10)
+for role, content in history:
+    with st.chat_message(role, avatar="🧑‍💻" if role == "user" else "🤖"):
+        st.markdown(content)
 
-# ==========================================
-# 4. 主干：对话历史渲染
-# ==========================================
-# 读取该用户所有的历史对话用于前端页面展示
-with sqlite3.connect(DB_PATH) as conn:
-    all_msgs = conn.execute(
-        "SELECT track, role, content FROM dual_chat_history WHERE user_id = ? ORDER BY id ASC", 
-        (user_id,)
-    ).fetchall()
-
-# 将线性数据重构为“回合(Turn)”制：包含一个用户提问，和A/B两个回答
-turns = []
-current_turn = None
-for track, role, content in all_msgs:
-    if role == 'user':
-        if current_turn:
-            turns.append(current_turn)
-        current_turn = {'user': content, 'A': '', 'B': ''}
-    else:
-        if current_turn is not None:
-            current_turn[track] = content
-if current_turn:
-    turns.append(current_turn)
-
-# 渲染历史 UI
-for turn in turns:
-    with st.chat_message("user"):
-        st.write(turn['user'])
-    
-    col_hist_a, col_hist_b = st.columns(2)
-    with col_hist_a:
-        if turn.get('A'):
-            with st.chat_message("assistant", avatar="🔵"):
-                st.write(turn['A'])
-    with col_hist_b:
-        if turn.get('B'):
-            with st.chat_message("assistant", avatar="🔴"):
-                st.write(turn['B'])
-
-# ==========================================
-# 5. 用户输入与大模型并发调用
-# ==========================================
-if prompt := st.chat_input(f"以 {user_id} 的身份发言..."):
-    # 1. 保存用户的提问到持久化数据库
-    save_message(user_id, 'USER', 'user', prompt)
-    
-    # 2. 在界面上直接渲染刚刚输入的问题
-    with st.chat_message("user"):
-        st.write(prompt)
+if prompt := st.chat_input("试着问时间、查询昨日新闻、或者上传表格让它分析..."):
+    save_message(user_id, 'user', prompt)
+    with st.chat_message("user", avatar="🧑‍💻"):
+        st.markdown(prompt)
         
-    # 3. 准备获取该用户平行宇宙的上下文记忆
-    history_a = get_history(user_id, 'A', limit=memory_limit) 
-    history_b = get_history(user_id, 'B', limit=memory_limit)
+    # 🌟 架构升维：每次发起对话前，动态获取此刻的物理时间，并悄悄注入到系统大本营里
+    current_time_str = datetime.now().strftime("%Y年%m月%d日 %H:%M:%S")
+    dynamic_sys_prompt = SUPERVISOR_SYSTEM_PROMPT_BASE + f"\n\n【系统内部状态】：当前的准确物理时间是 {current_time_str}。在搜索实时新闻或回答时间相关问题时，请务必以此为时间锚点。"
     
-    def build_langchain_messages(hist, sys_p, current_prompt):
-        msgs = []
-        if sys_p.strip():
-            msgs.append(SystemMessage(content=sys_p))
-        for r, c in hist:
-            if r == 'user':
-                msgs.append(HumanMessage(content=c))
-            else:
-                msgs.append(AIMessage(content=c))
-        msgs.append(HumanMessage(content=current_prompt))
-        return msgs
+    messages = [SystemMessage(content=dynamic_sys_prompt)]
+    for r, c in history: messages.append(HumanMessage(content=c) if r == 'user' else AIMessage(content=c))
+    messages.append(HumanMessage(content=prompt))
 
-    messages_a = build_langchain_messages(history_a, sys_prompt, prompt)
-    messages_b = build_langchain_messages(history_b, sys_prompt, prompt)
-
-    col_a, col_b = st.columns(2)
-    
-    # 4. 封装流式对话与计费记录器
-    def run_chat_stream(model_name, container, messages, track_name, avatar_emoji):
-        with container:
-            with st.chat_message("assistant", avatar=avatar_emoji):
-                st.caption(f"`{model_name}`")
-                placeholder = st.empty()
+    with st.chat_message("assistant", avatar="🤖"):
+        status = st.status("🧠 大管家正在推演行动路线...", expanded=True)
+        llm = ChatOpenAI(model=model_name, api_key=settings.API_KEY, base_url=settings.API_BASE, temperature=0.1)
+        
+        final_answer = ""
+        for step in range(4): # 最大推演步数
+            try:
+                response = llm.invoke(messages).content
+                messages.append(AIMessage(content=response)) 
+                tool_match = re.search(r'<tool_call>\s*(.*?)\s*</tool_call>', response, re.DOTALL)
                 
-                llm = ChatOpenAI(
-                    model=model_name,
-                    api_key=settings.API_KEY,
-                    base_url=settings.API_BASE,
-                    temperature=0.7,
-                    model_kwargs={"stream_options": {"include_usage": True}}
-                )
-                
-                full_text = ""
-                with get_openai_callback() as cb:
+                if tool_match:
                     try:
-                        for chunk in llm.stream(messages):
-                            full_text += chunk.content
-                            placeholder.markdown(full_text + " ▌")
-                        placeholder.markdown(full_text)
+                        tool_req = json.loads(tool_match.group(1))
+                        t_name, t_args = tool_req.get("name"), tool_req.get("args", {})
+                        status.write(f"🛠️ 决定调用工具: `{t_name}` | 参数: `{t_args}`")
                         
-                        # 记录回答至长期记忆
-                        save_message(user_id, track_name, 'assistant', full_text)
-                        
-                        # 计费拦截写入
-                        tokens = cb.total_tokens
-                        if tokens == 0:
-                            tokens = int(len(str(messages)) + len(full_text) * 1.2)
-                        log_usage("双核记忆对话", model_name, tokens)
-                        
-                    except Exception as e:
-                        placeholder.error(f"❌ 请求失败: {e}")
-                        save_message(user_id, track_name, 'assistant', f"[生成失败: {e}]")
-
-    # 依次唤起左脑和右脑开始流式输出
-    with st.spinner(f"正在等待 {model_a} 回复..."):
-        run_chat_stream(model_a, col_a, messages_a, 'A', "🔵")
-    
-    with st.spinner(f"正在等待 {model_b} 回复..."):
-        run_chat_stream(model_b, col_b, messages_b, 'B', "🔴")
+                        tool_res = AVAILABLE_TOOLS[t_name](**t_args) if t_name in AVAILABLE_TOOLS else f"找不到工具: {t_name}"
+                        status.write(f"✅ 工具底层结果已返回 (长度:{len(str(tool_res))})")
+                        messages.append(HumanMessage(content=f"【系统通知：工具 {t_name} 执行结果】\n{tool_res}"))
+                    except json.JSONDecodeError:
+                        messages.append(HumanMessage(content="【系统警告】：工具调用的 JSON 格式不规范，请重试。"))
+                else:
+                    final_answer = response
+                    break
+            except Exception as e:
+                final_answer = f"大管家推演中断: {str(e)}"
+                break
         
-    # 流式播放完毕后刷新一次界面，使历史对话块被完全固化
-    st.rerun()
+        if not final_answer: final_answer = "推演达到了最大步数限制，未能得出结论。"
+        status.update(label="任务调度与执行完毕！", state="complete", expanded=False)
+        st.markdown(final_answer)
+        save_message(user_id, 'assistant', final_answer)

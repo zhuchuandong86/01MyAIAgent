@@ -7,7 +7,6 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnablePassthrough
 from langchain_classic.retrievers import EnsembleRetriever
-from core.settings import settings
 
 # 【修复】：使用绝对导入
 from modules.rag.config import Config 
@@ -15,7 +14,7 @@ from modules.rag.reranker import build_rerank_retriever
 # 👇【新增】：导入中台统管的 RAG 提示词
 from core.prompts import RAG_SYSTEM_PROMPT
 
-os.environ['NO_PROXY'] = settings.INTERNAL_URL
+os.environ['NO_PROXY'] = 'api.openai.rnd.huawei.com'
 
 def format_docs(docs):
     formatted_texts = []
