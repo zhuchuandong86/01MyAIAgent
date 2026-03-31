@@ -27,10 +27,12 @@ fallback_1 = getattr(settings, "MODEL_EDITOR", settings.MODEL_TEXT)
 fallback_2 = getattr(settings, "MODEL_BLUE", settings.MODEL_TEXT)
 fallback_3 = getattr(settings, "MODEL_RED", settings.MODEL_TEXT)
 
-# 实例化客户端 (复用全局配置)
-brain_client = OpenAI(api_key=API_KEY, base_url=API_BASE)
-coder_client = OpenAI(api_key=API_KEY, base_url=API_BASE)
-vision_client = OpenAI(api_key=API_KEY, base_url=API_BASE) 
+# 实例化客户端 (增加严格的物理超时防卡死！)
+# timeout=60.0 表示：如果大模型 60 秒内连个屁都不放（没返回数据），直接抛出 Timeout 异常！
+# 这样就能立刻触发我们的 try...except，从而无缝切换到备用模型！
+brain_client = OpenAI(api_key=API_KEY, base_url=API_BASE, timeout=60.0)
+coder_client = OpenAI(api_key=API_KEY, base_url=API_BASE, timeout=120.0) # 写代码可能比较慢，给 120 秒
+vision_client = OpenAI(api_key=API_KEY, base_url=API_BASE, timeout=60.0)
 
 # ==========================================
 # 1. 物理工作区与核心记忆初始化 (统一由 paths 接管，防止污染源码目录)
@@ -127,13 +129,24 @@ def read_file(filepath: str) -> str:
     except Exception as e: return f"读取失败: {str(e)}"
 
 def search_web(query: str) -> str:
+    """真正的全网搜索引擎，支持定向搜索 GitHub 等站点"""
     try:
-        url = f"https://zh.wikipedia.org/w/api.php?action=query&list=search&srsearch={urllib.parse.quote(query)}&utf8=&format=json"
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        data = json.loads(urllib.request.urlopen(req, timeout=10).read().decode('utf-8'))
-        if not data['query']['search']: return "无检索结果"
-        return "\n---\n".join([f"【{r['title']}】: {re.sub(r'<[^>]+>', '', r['snippet'])}" for r in data['query']['search'][:4]])
-    except Exception as e: return f"搜索链路断开: {str(e)}"
+        from duckduckgo_search import DDGS
+        with DDGS() as ddgs:
+            # 搜索前 5 条结果
+            results = list(ddgs.text(query, max_results=5))
+            if not results:
+                return "无检索结果"
+            
+            formatted_results = []
+            for r in results:
+                # 把标题、链接和摘要都返回给大模型
+                formatted_results.append(f"【{r['title']}】({r['href']}): {r['body']}")
+            return "\n---\n".join(formatted_results)
+    except ImportError:
+        return "❌ 缺少 duckduckgo-search 库，请先让 Coder 执行 pip install duckduckgo-search"
+    except Exception as e: 
+        return f"搜索链路断开: {str(e)}"
 
 def append_memory(lesson: str) -> str:
     try:
@@ -167,7 +180,11 @@ def ask_vision(image_filename: str, question: str) -> str:
 tools = [
     {"type": "function", "function": {"name": "execute_bash", "description": "系统终端权限。运行脚本、装包、查系统信息均用此工具。", "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}},
     {"type": "function", "function": {"name": "read_file", "description": "文本阅读。非常重要！用于提取任务前的试探，以及代码执行后的【数据审核】！", "parameters": {"type": "object", "properties": {"filepath": {"type": "string"}}, "required": ["filepath"]}}},
-    {"type": "function", "function": {"name": "search_web", "description": "查世界知识、查报错。", "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}},
+    {"type": "function", "function": {
+        "name": "search_web", 
+        "description": "真正的全网搜索引擎。遇到写代码报错、缺库、反爬，立刻调用此工具。你可以使用高级搜索语法，例如加上 'site:github.com' 或 'site:stackoverflow.com' 来精准寻找程序员的解决方案！", 
+        "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}
+    }},
     {"type": "function", "function": {"name": "append_memory", "description": "将花费极大精力排查出的经验沉淀下来。", "parameters": {"type": "object", "properties": {"lesson": {"type": "string"}}, "required": ["lesson"]}}},
     {"type": "function", "function": {"name": "ask_vision", "description": "面对扫描件、图片等调用此接口。", "parameters": {"type": "object", "properties": {"image_filename": {"type": "string"}, "question": {"type": "string"}}, "required": ["image_filename", "question"]}}},
     {"type": "function", "function": {
@@ -220,6 +237,12 @@ def get_system_prompt():
 3. Errors: If you face an error, debug it autonomously. DO NOT give up easily.
 4. Validation: Verify output files exist and contain real data before declaring success.
 5. 🌟 Long-term Learning (CRITICAL): If the user scolds you, corrects your mistakes, or provides a new rule, you MUST immediately call the `append_memory` tool to save the lesson into your Long-term Memory permanently!
+6. 🌟 Tool Formatting (CRITICAL): You MUST use the native API function calling framework. NEVER output raw JSON, XML, or `<tool_call>` tags in your conversational text response. If you need to execute a tool like `execute_bash`, invoke it silently through the function API. Do not write the JSON command in your text reply!
+7. 🌟 Autonomous Self-Evolution (CRITICAL):
+    -你必须具备自我进化的能力！在每一次任务彻底完成（准备向用户进行最后汇报）之前，你必须在脑子里强制进行一次【复盘】：
+    -问自己：在这个任务中，我是否遇到了报错、拒绝访问或超时？
+    -问自己：我是用什么具体的代码或工具绕过这个坑的？
+    -如果你在任务中经历了“失败 -> 尝试新方法 -> 最终成功”的过程，你【绝对不准】直接结束任务！你必须先静默调用 append_memory，把“我踩了什么坑 + 我是怎么解决的”提炼成一条铁律写进长期记忆，然后再向用户汇报任务完成
 """
 
 if "zclaw_messages" not in st.session_state:
@@ -278,9 +301,19 @@ if prompt := st.chat_input("向中枢下发任务或指出它的错误..."):
                 func_name = tool_call.function.name
                 try:
                     args = json.loads(tool_call.function.arguments)
+                    
+                    # 🌟【防呆补丁】：如果大模型抽风只传了一个字符串，强行帮它包装成字典！
+                    if isinstance(args, str):
+                        if func_name == "append_memory": args = {"lesson": args}
+                        elif func_name == "execute_bash": args = {"command": args}
+                        elif func_name == "search_web": args = {"query": args}
+                        elif func_name == "read_file": args = {"filepath": args}
+                        else: args = {}
+                        
                 except Exception as e:
                     args = {}
-                    st.session_state.zclaw_messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": f"参数解析失败: {e}"})
+                    # 把报错信息扔回给大模型，逼它下一次用标准 JSON 传参
+                    st.session_state.zclaw_messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": f"参数解析失败: {e}。工具参数必须是标准的 JSON Object 字典！"})
                     continue
                 
                 if func_name == "delegate_to_coder": status.write(f"🤝 **调度外包 [Coder]:** `{args.get('filepath', '未知')}`")
