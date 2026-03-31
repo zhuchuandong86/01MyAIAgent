@@ -401,24 +401,32 @@ def run_agent_pipeline(dfs: dict, user_query: str, api_key: str, api_base: str):
         with open(report_out, "w", encoding="utf-8") as f: f.write(final_markdown)
         return final_markdown, report_out, {} 
         
-    html_string = generate_html_report(final_markdown, report_out)
-
     # =========================================================
-    # 【核心修复】将生成的图表强行转化为 Base64 注入 HTML
-    #  彻底绕开浏览器对本地资源的安全拦截机制
+    # 【核心修复】将图表从临时沙箱目录拷出，必须在 generate_html_report 之前！
+    # 这样 reporter.py 才能在当前目录下找到并注入 Base64
     # =========================================================
     for src in glob.glob(os.path.join(chart_dir, "chart_*.png")):
         img_filename = os.path.basename(src)
-        shutil.copy2(src, img_filename) # 拷出来以防需要手动查看
+        shutil.copy2(src, img_filename) 
+
+    # 现在执行渲染，reporter.py 就能完美捕获图片了
+    html_string = generate_html_report(final_markdown, report_out)
+
+    # 暴力替换第二道防线（防止大模型没有用 [CHART_1] 而是直接写了 Markdown 图片语法）
+    for src in glob.glob(os.path.join(chart_dir, "chart_*.png")):
+        img_filename = os.path.basename(src)
         
         with open(src, "rb") as image_file:
             encoded_string = base64.b64encode(image_file.read()).decode()
         b64_src = f"data:image/png;base64,{encoded_string}"
         
-        # 暴力替换 HTML 中所有可能存在的图片路径引用
         html_string = html_string.replace(img_filename, b64_src)
         html_string = html_string.replace(urllib.parse.quote(img_filename), b64_src)
         html_string = html_string.replace(f"./{img_filename}", b64_src)
+
+    # 将最终完整替换好的 HTML 重新保存覆盖
+    with open(report_out, "w", encoding="utf-8") as f:
+        f.write(html_string)
 
     return html_string, report_out, {"plan": final_state["plan"], "data": final_state["execution_logs"]}
 

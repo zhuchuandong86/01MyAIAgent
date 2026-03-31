@@ -5,7 +5,6 @@ from datetime import datetime
 
 import core.paths
 from core.settings import settings
-from langchain_openai import ChatOpenAI
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
 
@@ -16,7 +15,7 @@ from modules.multi_compare.main_trend import generate_trend_summary
 from modules.multi_compare.renderers.my_html_renderer import export_to_html
 from modules.multi_compare.renderers.excel_builder import export_tables_to_excel
 
-# 【重构架构引入】
+# 【统一引入 RAG 与提示词管家】
 from modules.multi_compare.template_service import (
     get_available_templates, get_style_templates, get_embeddings, 
     TEMPLATE_MD_DIR, TEMPLATE_DB_DIR
@@ -26,9 +25,6 @@ from modules.multi_compare.ui_prompts import (
     UI_CHART_MERMAID, GET_USER_PRIORITY, GET_STYLE_FUSION
 )
 
-# ==========================================
-# 1. 核心路径防呆设计 & 缓存目录
-# ==========================================
 OUTPUT_DIR = str(core.paths.GLOBAL_DATA_DIR)
 UPLOAD_DIR = str(core.paths.UPLOAD_DIR)
 TEMP_IMG_DIR = os.path.join(OUTPUT_DIR, "pdf_temp_images")
@@ -37,9 +33,6 @@ MD_CACHE_DIR = os.path.join(OUTPUT_DIR, "md_cache")
 os.makedirs(TEMP_IMG_DIR, exist_ok=True)
 os.makedirs(MD_CACHE_DIR, exist_ok=True)
 
-# ==========================================
-# 2. 页面基本设置 & CSS
-# ==========================================
 st.set_page_config(page_title="AI 材料深度解读工作台", page_icon="📊", layout="wide", initial_sidebar_state="expanded")
 
 st.markdown("""
@@ -59,14 +52,11 @@ st.markdown("""
 with st.sidebar:
     max_pages = st.number_input("原文件最大解析页数 (防超载)", min_value=1, max_value=500, value=100)
     st.markdown("---")
-    use_cache = st.checkbox("⚡ 启用极速解析缓存\n\n(若勾选：曾提取过的PDF/图片将直接复用底层MD缓存。)", value=True)
+    use_cache = st.checkbox("⚡ 启用极速解析缓存", value=True)
 
 st.markdown("### 📊 AI 材料深度解读工作台")
 st.markdown("基于多模态大模型，支持上传 PDF、图片、MD 混合格式，进行单文档解析、多文件横评与纵向趋势推演。")
 
-# ==========================================
-# 工具函数：统一的导出渲染组件 (DRY)
-# ==========================================
 def render_export_buttons(summary_md, base_filename, report_type="报告"):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     md_name = f"{base_filename}_{report_type}_{timestamp}.md"
@@ -91,9 +81,6 @@ def render_export_buttons(summary_md, base_filename, report_type="报告"):
         with cols[2]:
             with open(final_excel_file, "rb") as f: st.download_button("📊 Excel数据表", f, file_name=excel_name, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-# ==========================================
-# 阅后即焚的文件解析引擎 (带MD5指纹)
-# ==========================================
 def parse_files_to_text_dict(uploaded_files, max_pages, ui_container, enable_cache):
     result_dict = {}
     for file in uploaded_files:
@@ -148,14 +135,11 @@ def parse_files_to_text_dict(uploaded_files, max_pages, ui_container, enable_cac
                     if os.path.exists(img_path): os.remove(img_path)
                 ui_container.success(f"✅ {file.name} 解析完成，已存入物理指纹缓存池！")
             except Exception as e:
-                ui_container.warning(f"✅ {file.name} 解析完成，清理临时文件报小错: {e}")
+                pass
                 
             result_dict[base_name] = all_content
     return result_dict
 
-# ==========================================
-# 3. 终极工作流（包含全部四个 Tab）
-# ==========================================
 tab1, tab2, tab3, tab4 = st.tabs([
     "🚀 单份文档智能解析", 
     "⚔️ 多公司竞品横评",
@@ -176,7 +160,6 @@ with tab1:
     with col_tpl:
         options = ["🤖 AI 自动匹配金牌范例 (推荐)"] + get_available_templates()
         selected_strategy = st.selectbox("🎯 选择报告行文风格：", options, key="tab1_strategy")
-        st.caption("选自动匹配，大模型将亲自阅读并从模板库海选最像的参考。")
 
     col_btn1, col_btn2 = st.columns(2)
     with col_btn1: btn_extract_only = st.button("📝 仅提取数据底稿 (生成 MD)", use_container_width=True)
@@ -210,22 +193,20 @@ with tab1:
             if selected_strategy.startswith("🤖") and ai_thinking_log:
                 st.info(f"🤖 **大模型主编的选版笔记**：\n\n{ai_thinking_log}")
 
-            enhanced_requirement = ""
-            enhanced_requirement += GET_USER_PRIORITY(user_requirement_full)
-            enhanced_requirement += UI_COGNITIVE_SINGLE
+            # 🌟 组合单文档指令
+            style_instruction = GET_USER_PRIORITY(user_requirement_full) + UI_COGNITIVE_SINGLE
             if templates_str:
-                enhanced_requirement += GET_STYLE_FUSION(templates_str) + UI_CHART_MERMAID
+                style_instruction += GET_STYLE_FUSION(templates_str, report_type="single") + UI_CHART_MERMAID
 
             st.markdown("###### 🧠 深度研判报告生成中")
             with st.spinner('红蓝军对抗与模板融合推演中...'):
-                summary = generate_final_summary(all_content, enhanced_requirement)
+                summary = generate_final_summary(all_content, user_req=user_requirement_full, style_instruction=style_instruction)
                 
             st.success("🎉 研判报告已生成！")
             st.markdown("---")
             st.markdown(summary, unsafe_allow_html=True)
             
             final_md_content = f"# AI 深度洞察与业务研判报告\n\n{summary}\n\n---\n## 📚 附录：原始底层数据\n<details markdown=\"1\">\n<summary>👉 点击展开查看各页原始核心数据</summary>\n\n{all_content}\n</details>"
-            
             render_export_buttons(final_md_content, base_name, "研判报告")
 
 # ---------------------------------------------------------
@@ -237,11 +218,10 @@ with tab2:
     
     col_req_b, col_tpl_b = st.columns([2, 1])
     with col_req_b:
-        user_requirement_b = st.text_area("🎯 自定义分析侧重点 (选填)", placeholder="例如：请重点对比各家在5G专网和云服务市场上的战略差异...", height=100, key="tab2_req")
+        user_requirement_b = st.text_area("🎯 自定义分析侧重点 (选填)", placeholder="例如：请重点对比各家在云服务市场上的战略差异...", height=100, key="tab2_req")
     with col_tpl_b:
         options = ["🤖 AI 自动匹配金牌范例 (推荐)"] + get_available_templates()
         selected_strategy_b = st.selectbox("🎯 选择报告行文风格：", options, key="tab2_strategy")
-        st.caption("选自动匹配，大模型将亲自阅读并从模板库海选最像的参考。")
 
     compare_files = st.file_uploader("批量拖拽多个公司的文件至此", type=["pdf", "png", "jpg", "jpeg", "md"], accept_multiple_files=True, key="tab2_uploader")
     
@@ -251,37 +231,27 @@ with tab2:
             st.stop()
             
         status_container = st.container()
+        # 🌟 删除了冗余的 Map 脱水代码，直接走到底层
         company_dict = parse_files_to_text_dict(compare_files, max_pages, status_container, use_cache)
         
-        # 🌟 Map-Reduce 并行脱水，防长文本溢出
-        compressed_company_dict = {}
-        with st.status("🗜️ 正在执行并行数据脱水 (Map-Reduce 级压缩防溢出)...", expanded=True) as map_status:
-            llm_map = ChatOpenAI(model=settings.MODEL_TEXT or "deepseek-v3-0324", api_key=settings.API_KEY, base_url=settings.API_BASE, temperature=0.1)
-            for comp_name, comp_content in company_dict.items():
-                map_status.write(f"⏳ 正在提纯【{comp_name}】的核心财报数据...")
-                map_prompt = f"请从以下数万字原文档中，浓缩出【{comp_name}】的核心财务指标和战略方向。\n如果有用户要求：【{user_requirement_b}】，请优先提取。\n控制在1200字以内。\n原文：\n{comp_content[:30000]}"
-                try: compressed_company_dict[comp_name] = llm_map.invoke(map_prompt).content
-                except Exception: compressed_company_dict[comp_name] = comp_content[:3000] 
-            map_status.update(label="✅ 文档脱水提纯完毕！", state="complete")
-
-        all_content_for_search = "\n".join(list(compressed_company_dict.values()))[:1000]
+        all_content_for_search = "\n".join(list(company_dict.values()))[:1000]
         with st.status("🧠 正在检索并研判人类金牌经验库...", expanded=True) as status:
             templates_str, ai_thinking_log = get_style_templates(all_content_for_search, selected_strategy_b, status)
             
         if selected_strategy_b.startswith("🤖") and ai_thinking_log:
             st.info(f"🤖 **大模型主编的选版笔记**：\n\n{ai_thinking_log}")
 
-        style_instruction = ""
-        style_instruction += GET_USER_PRIORITY(user_requirement_b)
-        style_instruction += UI_COGNITIVE_COMPARE
+        # 🌟 横评传入 "compare" 模式，彻底防污染
+        style_instruction = GET_USER_PRIORITY(user_requirement_b) + UI_COGNITIVE_COMPARE
         if templates_str:
-            style_instruction += GET_STYLE_FUSION(templates_str) + UI_CHART_MERMAID
+            style_instruction += GET_STYLE_FUSION(templates_str, report_type="compare") + UI_CHART_MERMAID
 
         if style_instruction:
-            compressed_company_dict["_STYLE_INSTRUCTION_"] = style_instruction
+            company_dict["_STYLE_INSTRUCTION_"] = style_instruction
+        if user_requirement_b.strip():
+            company_dict["_USER_REQ_"] = user_requirement_b.strip()
             
         st.markdown("###### 🧠 多模态竞品大脑生成中")
-        # 🌟 把 status 容器传进底层，让底层能往页面上打印进度
         with st.status('正在强制大模型交叉校验数据，剔除无据猜测...', expanded=True) as status_ui_b:
             compare_summary = generate_compare_summary(company_dict, status_ui_b)
             status_ui_b.update(label="✅ 竞品横评数据处理与深度推演完毕！", state="complete", expanded=False)
@@ -291,9 +261,8 @@ with tab2:
         st.markdown(compare_summary, unsafe_allow_html=True)
         
         final_md_content = f"# ⚔️ 行业竞品横向对比研判报告\n\n{compare_summary}"
-        names = [k for k in company_dict.keys() if k != "_STYLE_INSTRUCTION_"]
+        names = [k for k in company_dict.keys() if k not in ["_STYLE_INSTRUCTION_", "_USER_REQ_"]]
         prefix = "vs".join(names[:3]) + ("等" if len(names)>3 else "")
-        
         render_export_buttons(final_md_content, prefix, "竞品横评")
 
 # ---------------------------------------------------------
@@ -305,11 +274,10 @@ with tab3:
     
     col_req_c, col_tpl_c = st.columns([2, 1])
     with col_req_c:
-        user_requirement_c = st.text_area("🎯 自定义分析侧重点 (选填)", placeholder="例如：重点推演近三年这几家公司研发投入的飙升幅度...", height=100, key="tab3_req")
+        user_requirement_c = st.text_area("🎯 自定义分析侧重点 (选填)", placeholder="例如：重点推演近三年研发投入的飙升幅度...", height=100, key="tab3_req")
     with col_tpl_c:
         options = ["🤖 AI 自动匹配金牌范例 (推荐)"] + get_available_templates()
         selected_strategy_c = st.selectbox("🎯 选择报告行文风格：", options, key="tab3_strategy")
-        st.caption("选自动匹配，大模型将亲自阅读并从模板库海选最像的参考。")
 
     trend_files = st.file_uploader("批量拖拽多年的文件至此", type=["pdf", "png", "jpg", "jpeg", "md"], accept_multiple_files=True, key="tab3_uploader")
     
@@ -319,37 +287,27 @@ with tab3:
             st.stop()
             
         status_container = st.container()
+        # 🌟 删除了冗余的 Map 脱水代码
         yearly_dict = parse_files_to_text_dict(trend_files, max_pages, status_container, use_cache)
-        
-        # 🌟 历年财报单点脱水
-        compressed_yearly_dict = {}
-        with st.status("🗜️ 正在执行并行数据脱水 (提纯历年财报防溢出)...", expanded=True) as map_status_c:
-            llm_map_c = ChatOpenAI(model=settings.MODEL_TEXT or "deepseek-v3-0324", api_key=settings.API_KEY, base_url=settings.API_BASE, temperature=0.1)
-            for year_name, year_content in yearly_dict.items():
-                map_status_c.write(f"⏳ 正在提纯【{year_name}年】的核心商业切片...")
-                map_prompt_c = f"请从以下年度文档中，浓缩出【{year_name}】的核心财务指标和战略变迁动作。\n用户推演要求：【{user_requirement_c}】\n控制在1000字以内。\n原文：\n{year_content[:30000]}"
-                try: compressed_yearly_dict[year_name] = llm_map_c.invoke(map_prompt_c).content
-                except Exception: compressed_yearly_dict[year_name] = year_content[:3000]
-            map_status_c.update(label="✅ 历年财报提纯完毕！", state="complete")
 
-        all_content_for_search = "\n".join(list(compressed_yearly_dict.values()))[:1000]
+        all_content_for_search = "\n".join(list(yearly_dict.values()))[:1000]
         with st.status("🧠 正在检索并研判人类金牌经验库...", expanded=True) as status:
             templates_str, ai_thinking_log = get_style_templates(all_content_for_search, selected_strategy_c, status)
             
         if selected_strategy_c.startswith("🤖") and ai_thinking_log:
             st.info(f"🤖 **大模型主编的选版笔记**：\n\n{ai_thinking_log}")
 
-        style_instruction = ""
-        style_instruction += GET_USER_PRIORITY(user_requirement_c)
-        style_instruction += UI_COGNITIVE_TREND
+        # 🌟 趋势传入 "trend" 模式
+        style_instruction = GET_USER_PRIORITY(user_requirement_c) + UI_COGNITIVE_TREND
         if templates_str:
-            style_instruction += GET_STYLE_FUSION(templates_str) + UI_CHART_MERMAID
+            style_instruction += GET_STYLE_FUSION(templates_str, report_type="trend") + UI_CHART_MERMAID
 
         if style_instruction:
-            compressed_yearly_dict["_STYLE_INSTRUCTION_"] = style_instruction
+            yearly_dict["_STYLE_INSTRUCTION_"] = style_instruction
+        if user_requirement_c.strip():
+            yearly_dict["_USER_REQ_"] = user_requirement_c.strip()
 
         st.markdown("###### 🧠 历史趋势大脑生成中")
-        # 🌟 把 status 容器传进底层，让底层能往页面上打印进度
         with st.status('正在梳理历年时间轴，甄别断层数据...', expanded=True) as status_ui_c:
             trend_summary = generate_trend_summary(yearly_dict, status_ui_c)
             status_ui_c.update(label="✅ 历年趋势数据处理与深度推演完毕！", state="complete", expanded=False)
@@ -359,9 +317,8 @@ with tab3:
         st.markdown(trend_summary, unsafe_allow_html=True)
         
         final_md_content = f"# 📈 企业纵向战略演进与周期复盘报告\n\n{trend_summary}"
-        years = sorted([k for k in yearly_dict.keys() if k != "_STYLE_INSTRUCTION_"])
+        years = sorted([k for k in yearly_dict.keys() if k not in ["_STYLE_INSTRUCTION_", "_USER_REQ_"]])
         prefix = f"{years[0]}至{years[-1]}年" if len(years) > 1 else years[0]
-        
         render_export_buttons(final_md_content, prefix, "演进趋势")
 
 # ---------------------------------------------------------
@@ -380,7 +337,6 @@ with tab4:
             status_container = st.container()
             with st.status("🧠 正在吸收人类智慧入库...", expanded=True) as status:
                 embeddings = get_embeddings()
-                
                 db_path = os.path.join(TEMPLATE_DB_DIR, "index.faiss")
                 vectorstore = FAISS.load_local(TEMPLATE_DB_DIR, embeddings, allow_dangerous_deserialization=True) if os.path.exists(db_path) else None
                 
@@ -398,10 +354,8 @@ with tab4:
                     status.write(f"✅ `{base_name}` 经验已成功向量化并吸收！")
                 
                 if new_docs:
-                    if vectorstore is None:
-                        vectorstore = FAISS.from_documents(new_docs, embeddings)
-                    else:
-                        vectorstore.add_documents(new_docs)
+                    if vectorstore is None: vectorstore = FAISS.from_documents(new_docs, embeddings)
+                    else: vectorstore.add_documents(new_docs)
                     vectorstore.save_local(TEMPLATE_DB_DIR)
                     status.update(label="🎉 经验库更新完成！全局指纹系统已打通！", state="complete")
     
@@ -409,7 +363,5 @@ with tab4:
     st.markdown("#### 🏆 已收录的金牌模板清单")
     existing_tpls = get_available_templates()
     if existing_tpls:
-        for tpl in existing_tpls:
-            st.markdown(f"- 📄 `{tpl}`")
-    else:
-        st.markdown("*当前经验库为空，请上传您的第一份金牌报告！*")
+        for tpl in existing_tpls: st.markdown(f"- 📄 `{tpl}`")
+    else: st.markdown("*当前经验库为空，请上传您的第一份金牌报告！*")

@@ -1,4 +1,3 @@
-# modules/multi_compare/main.py
 import os
 import time
 from modules.multi_compare.api_client import call_api
@@ -25,18 +24,19 @@ def process_single_page(image_path, page_num):
         {"type": "text", "text": DOC_VISION_EXTRACT.format(page_num=page_num)},
         {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_img}"}}
     ]}]
-    return call_api(messages, model_name=MODEL_VISION, stream=False).strip()
+    return call_api(messages, model_name=MODEL_VISION, stream=True, silent_stream=True).strip()
 
 def get_safe_text_for_model(text, model_name):
-    limit = 40000 
+    # 防网关超时截断极限
+    limit = 10000 
     name_lower = model_name.lower()
-    if "deepseek-v3-0324" in name_lower: limit = 38000   
-    elif "deepseek-r1" in name_lower: limit = 60000   
-    elif "72b" in name_lower or "30b" in name_lower or "256k" in name_lower: limit = 120000  
+    if "deepseek-v3" in name_lower: limit = 10000   
+    elif "deepseek-r1" in name_lower: limit = 12000   
+    elif "72b" in name_lower or "30b" in name_lower or "256k" in name_lower: limit = 20000  
         
     if len(text) > limit:
-        print(f"✂️ [安全管控] {model_name} 触发阈值，动态截断至 {limit} 字符...")
-        return text[:limit] + f"\n\n...[警告：由于算力限制，尾部已安全截断]..."
+        print(f"✂️ [防 504 截断] {model_name} 触发阈值，动态截断至 {limit} 字符...")
+        return text[:limit] + f"\n\n...[警告：为防网关超时，尾部已安全截断]..."
     return text
 
 def _call_specialist_agent(role_prompt, full_text, model_name, agent_name):
@@ -48,7 +48,8 @@ def _call_specialist_agent(role_prompt, full_text, model_name, agent_name):
     ]
     return call_api(messages, model_name=model_name, stream=True, silent_stream=True)
 
-def generate_final_summary(full_text, user_req=""):
+# 🌟 核心修复：接收拆分后的 user_req 和 style_instruction
+def generate_final_summary(full_text, user_req="", style_instruction=""):
     print("\n🤖 [Multi-Agent 启动] 正在唤醒虚拟专家团队进行红蓝对抗...")
     
     user_directive_agent = ""
@@ -60,7 +61,6 @@ def generate_final_summary(full_text, user_req=""):
     blue_prompt = DOC_BLUE_AGENT + user_directive_agent
     red_prompt = DOC_RED_AGENT + user_directive_agent
     
-    # 🛡️【柔性避震器】：取消并发，改为串行排队执行，防止内网网关崩溃
     blue_report = _call_specialist_agent(blue_prompt, full_text, MODEL_BLUE, "🔵 蓝军风控官")
     print("⏳ 缓冲避震中 (强制等待 3 秒释放 API 显存)...")
     time.sleep(3)
@@ -71,7 +71,8 @@ def generate_final_summary(full_text, user_req=""):
     editor_safe_text = get_safe_text_for_model(full_text, MODEL_EDITOR)
     editor_messages = [
         {"role": "system", "content": DOC_EDITOR_SYSTEM},
-        {"role": "user", "content": DOC_EDITOR_USER.format(
+        # 🌟 核心修复：将 XML 指令置顶！保障系统防幻觉法则不被稀释
+        {"role": "user", "content": style_instruction + "\n\n" + DOC_EDITOR_USER.format(
             editor_safe_text=editor_safe_text, blue_report=blue_report, red_report=red_report, user_directive_editor=user_directive_editor)}
     ]
     final_summary = call_api(editor_messages, model_name=MODEL_EDITOR, stream=True)
