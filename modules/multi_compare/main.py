@@ -39,27 +39,79 @@ def get_safe_text_for_model(text, model_name):
         return text[:limit] + f"\n\n...[警告：为防网关超时，尾部已安全截断]..."
     return text
 
+# 🌟 核心修改 1：重构专家阅卷引擎，彻底废弃截断，采用无损分块扫描！
 def _call_specialist_agent(role_prompt, full_text, model_name, agent_name):
-    print(f"[{agent_name}] 正在独立阅卷分析中...")
-    safe_text = get_safe_text_for_model(full_text, model_name)
-    messages = [
-        {"role": "system", "content": role_prompt},
-        {"role": "user", "content": f"以下是完整的报告提取数据，请严格按照你的角色设定指出具体问题（标明页码）：\n\n{safe_text}"}
-    ]
-    return call_api(messages, model_name=model_name, stream=True, silent_stream=True)
+    print(f"[{agent_name}] 启动独立阅卷，开始无损穿透阅读...")
+    chunk_size = 20000 
+    chunks = [full_text[i:i+chunk_size] for i in range(0, len(full_text), chunk_size)]
+    
+    all_reports = []
+    for idx, chunk in enumerate(chunks):
+        print(f"   -> 🔍 [{agent_name}] 正在深挖第 {idx+1}/{len(chunks)} 块核心数据 (流式保活中)...")
+        messages = [
+            {"role": "system", "content": role_prompt},
+            {"role": "user", "content": f"【当前阅读进度: 第 {idx+1}/{len(chunks)} 部分】\n请严格按照你的角色设定，深挖以下数据中的问题与细节（务必标明页码）：\n\n{chunk}"}
+        ]
+        part_res = call_api(messages, model_name=model_name, stream=True, silent_stream=True)
+        all_reports.append(part_res)
+        time.sleep(1)
+        
+    return "\n\n".join(all_reports)
+
+
+def _detect_doc_type(full_text, model_name):
+    """轻量前置调用：快速识别文档类型与行业，结果注入后续 prompt"""
+    sample = full_text[:2000]  # 只取前2000字，保证极速返回
+    messages = [{
+        "role": "user",
+        "content": f"""请用 JSON 格式输出以下文档的元信息，不要任何多余文字：
+{{"industry": "所属行业，如电信/金融/消费/科技/政策/其他",
+ "doc_type": "文档类型，如季报/年报/行业白皮书/政策文件/技术规范/会议纪要",
+ "reader": "核心读者，如管理层/投资人/监管机构/技术团队",
+ "key_focus": "本文档最核心的分析价值点，一句话"}}
+
+文档样本：
+{sample}"""
+    }]
+    try:
+        result = call_api(messages, model_name=model_name, stream=False, silent_stream=True)
+        import json, re
+        json_str = re.search(r'\{.*\}', result, re.DOTALL)
+        return json.loads(json_str.group()) if json_str else {}
+    except:
+        return {}
+
 
 # 🌟 核心修复：接收拆分后的 user_req 和 style_instruction
 def generate_final_summary(full_text, user_req="", style_instruction=""):
     print("\n🤖 [Multi-Agent 启动] 正在唤醒虚拟专家团队进行红蓝对抗...")
     
+    # 🌟 文档定性：快速识别行业与类型，驱动后续所有 prompt 自适应切换
+    print("\n🔍 [文档定性] 正在识别文档类型与行业...")
+    doc_meta = _detect_doc_type(full_text, MODEL_TEXT)
+    
+    industry = doc_meta.get("industry", "通用")
+    doc_type = doc_meta.get("doc_type", "报告")
+    reader = doc_meta.get("reader", "管理层")
+    key_focus = doc_meta.get("key_focus", "")
+    
+    print(f"✅ 文档定性完成：{industry}行业 | {doc_type} | 核心读者：{reader}")
+    
+    # 将文档元信息动态注入 agent 和 editor 的 prompt
+    doc_context = (
+        f"行业={industry}，类型={doc_type}，核心读者={reader}，核心价值点={key_focus}\n"
+        f"请基于以上定性结论，自动切换为最匹配的专业分析视角！"
+    )
+
     user_directive_agent = ""
     user_directive_editor = ""
     if user_req and user_req.strip():
-        user_directive_agent = f"\n\n【🌟 客户核心需求】：“{user_req.strip()}”。你在寻找数据时必须敏锐捕捉！"
-        user_directive_editor = f"【🌟 客户核心需求】：“{user_req.strip()}”。请在报告中优先、重点回应。\n\n"
+        user_directive_agent = f'\n\n【🌟 客户核心需求】：\u201c{user_req.strip()}\u201d。你在寻找数据时必须敏锐捕捉！'
+        user_directive_editor = f'【🌟 客户核心需求】：\u201c{user_req.strip()}\u201d。请在报告中优先、重点回应。\n\n'
     
-    blue_prompt = DOC_BLUE_AGENT + user_directive_agent
-    red_prompt = DOC_RED_AGENT + user_directive_agent
+    # 🌟 doc_context 同时注入红蓝双方 agent，确保专家视角与文档匹配
+    blue_prompt = DOC_BLUE_AGENT + f"\n\n【文档定性结论】：{doc_context}" + user_directive_agent
+    red_prompt = DOC_RED_AGENT + f"\n\n【文档定性结论】：{doc_context}" + user_directive_agent
     
     blue_report = _call_specialist_agent(blue_prompt, full_text, MODEL_BLUE, "🔵 蓝军风控官")
     print("⏳ 缓冲避震中 (强制等待 3 秒释放 API 显存)...")
@@ -71,13 +123,22 @@ def generate_final_summary(full_text, user_req="", style_instruction=""):
     editor_safe_text = get_safe_text_for_model(full_text, MODEL_EDITOR)
     editor_messages = [
         {"role": "system", "content": DOC_EDITOR_SYSTEM},
-        # 🌟 核心修复：将 XML 指令置顶！保障系统防幻觉法则不被稀释
+        # 🌟 核心修复：XML 指令置顶，doc_context 同步传入编辑器，驱动章节结构自适应
         {"role": "user", "content": style_instruction + "\n\n" + DOC_EDITOR_USER.format(
-            editor_safe_text=editor_safe_text, blue_report=blue_report, red_report=red_report, user_directive_editor=user_directive_editor)}
+            editor_safe_text=editor_safe_text,
+            blue_report=blue_report,
+            red_report=red_report,
+            user_directive_editor=user_directive_editor,
+            doc_context=doc_context  # 🌟 新增：文档定性结论传入编辑器
+        )}
     ]
     final_summary = call_api(editor_messages, model_name=MODEL_EDITOR, stream=True)
     
     if "⚠️ 本次提取彻底失败" in final_summary: return final_summary
         
-    preserved_agent_reports = f"\n\n---\n## 🗂️ 专家组独立研判底稿 (Multi-Agent)\n\n<details markdown=\"1\">\n<summary>🔵 点击展开【蓝军】挑刺报告</summary>\n\n{blue_report}\n\n</details>\n\n<details markdown=\"1\">\n<summary>🔴 点击展开【红军】增长报告</summary>\n\n{red_report}\n\n</details>\n"
+    preserved_agent_reports = (
+        f"\n\n---\n## 🗂️ 专家组独立研判底稿 (Multi-Agent)\n\n"
+        f"<details markdown=\"1\">\n<summary>🔵 点击展开【蓝军】挑刺报告</summary>\n\n{blue_report}\n\n</details>\n\n"
+        f"<details markdown=\"1\">\n<summary>🔴 点击展开【红军】增长报告</summary>\n\n{red_report}\n\n</details>\n"
+    )
     return final_summary + preserved_agent_reports

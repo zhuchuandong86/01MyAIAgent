@@ -156,17 +156,7 @@ with tab1:
     
     col_req, col_tpl = st.columns([2, 1])
     with col_req:
-        user_requirement_full = st.text_area(
-            "🎯 自定义分析侧重点 (选填)",
-            placeholder=(
-                "不填则 AI 自动识别文档类型并自适应分析视角。\n"
-                "也可手动指定侧重，例如：\n"
-                "• 财报：重点分析毛利率与现金流质量\n"
-                "• 政策文件：聚焦落地路径与关键时间节点\n"
-                "• 行业白皮书：提炼市场机会与竞争变量"
-            ),
-            height=120
-        )
+        user_requirement_full = st.text_area("🎯 自定义分析侧重点 (选填)", placeholder="例如：请重点提取各省份的 ARPU 值对比...", height=100)
     with col_tpl:
         options = ["🤖 AI 自动匹配金牌范例 (推荐)"] + get_available_templates()
         selected_strategy = st.selectbox("🎯 选择报告行文风格：", options, key="tab1_strategy")
@@ -228,17 +218,7 @@ with tab2:
     
     col_req_b, col_tpl_b = st.columns([2, 1])
     with col_req_b:
-        user_requirement_b = st.text_area(
-            "🎯 自定义分析侧重点 (选填)",
-            placeholder=(
-                "不填则 AI 自动识别行业并切换竞品对比视角。\n"
-                "也可手动指定，例如：\n"
-                "• 重点对比各家在云服务市场上的战略差异\n"
-                "• 聚焦研发投入强度与技术护城河的差距"
-            ),
-            height=120,
-            key="tab2_req"
-        )
+        user_requirement_b = st.text_area("🎯 自定义分析侧重点 (选填)", placeholder="例如：请重点对比各家在云服务市场上的战略差异...", height=100, key="tab2_req")
     with col_tpl_b:
         options = ["🤖 AI 自动匹配金牌范例 (推荐)"] + get_available_templates()
         selected_strategy_b = st.selectbox("🎯 选择报告行文风格：", options, key="tab2_strategy")
@@ -294,17 +274,7 @@ with tab3:
     
     col_req_c, col_tpl_c = st.columns([2, 1])
     with col_req_c:
-        user_requirement_c = st.text_area(
-            "🎯 自定义分析侧重点 (选填)",
-            placeholder=(
-                "不填则 AI 自动识别行业并切换纵向演进分析视角。\n"
-                "也可手动指定，例如：\n"
-                "• 重点推演近三年研发投入与商业化成果的关系\n"
-                "• 聚焦核心业务增速的拐点年份与战略归因"
-            ),
-            height=120,
-            key="tab3_req"
-        )
+        user_requirement_c = st.text_area("🎯 自定义分析侧重点 (选填)", placeholder="例如：重点推演近三年研发投入的飙升幅度...", height=100, key="tab3_req")
     with col_tpl_c:
         options = ["🤖 AI 自动匹配金牌范例 (推荐)"] + get_available_templates()
         selected_strategy_c = st.selectbox("🎯 选择报告行文风格：", options, key="tab3_strategy")
