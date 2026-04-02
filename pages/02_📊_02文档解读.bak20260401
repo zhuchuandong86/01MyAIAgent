@@ -57,8 +57,7 @@ with st.sidebar:
 st.markdown("### 📊 AI 材料深度解读工作台")
 st.markdown("基于多模态大模型，支持上传 PDF、图片、MD 混合格式，进行单文档解析、多文件横评与纵向趋势推演。")
 
-# ================= 替换 render_export_buttons 函数 =================
-def render_export_buttons(summary_md, base_filename, report_type="报告", docx_path=None):
+def render_export_buttons(summary_md, base_filename, report_type="报告"):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     md_name = f"{base_filename}_{report_type}_{timestamp}.md"
     html_name = f"{base_filename}_{report_type}_{timestamp}.html"
@@ -73,33 +72,14 @@ def render_export_buttons(summary_md, base_filename, report_type="报告", docx_
     has_excel = export_tables_to_excel(summary_md, final_excel_file)
     
     st.markdown("### 💾 导出报告")
-    
-    # 动态计算按钮数量：如果有 Word 产出，加一列
-    col_count = 2
-    if has_excel: col_count += 1
-    if docx_path and os.path.exists(docx_path): col_count += 1
-        
-    cols = st.columns(col_count)
-    curr_col = 0
-    
-    with cols[curr_col]:
+    cols = st.columns(3 if has_excel else 2)
+    with cols[0]:
         with open(final_md_file, "r", encoding="utf-8") as f: st.download_button("⬇️ Markdown版", f, file_name=md_name)
-    curr_col += 1
-        
-    with cols[curr_col]:
+    with cols[1]:
         with open(final_html_file, "r", encoding="utf-8") as f: st.download_button("🌐 HTML网页版", f, file_name=html_name)
-    curr_col += 1
-        
     if has_excel:
-        with cols[curr_col]:
+        with cols[2]:
             with open(final_excel_file, "rb") as f: st.download_button("📊 Excel数据表", f, file_name=excel_name, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        curr_col += 1
-            
-    # 🌟 核心新增：如果后台传递了 Word 路径，直接渲染出第四个蓝色下载按钮！
-    if docx_path and os.path.exists(docx_path):
-        with cols[curr_col]:
-            with open(docx_path, "rb") as f: st.download_button("📘 原生Word版 (DOCX)", f, file_name=f"{base_filename}_{report_type}_{timestamp}.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document", type="primary")
-
 
 def parse_files_to_text_dict(uploaded_files, max_pages, ui_container, enable_cache):
     result_dict = {}
@@ -176,17 +156,7 @@ with tab1:
     
     col_req, col_tpl = st.columns([2, 1])
     with col_req:
-        user_requirement_full = st.text_area(
-            "🎯 自定义分析侧重点 (选填)",
-            placeholder=(
-                "不填则 AI 自动识别文档类型并自适应分析视角。\n"
-                "也可手动指定侧重，例如：\n"
-                "• 财报：重点分析毛利率与现金流质量\n"
-                "• 政策文件：聚焦落地路径与关键时间节点\n"
-                "• 行业白皮书：提炼市场机会与竞争变量"
-            ),
-            height=120
-        )
+        user_requirement_full = st.text_area("🎯 自定义分析侧重点 (选填)", placeholder="例如：请重点提取各省份的 ARPU 值对比...", height=100)
     with col_tpl:
         options = ["🤖 AI 自动匹配金牌范例 (推荐)"] + get_available_templates()
         selected_strategy = st.selectbox("🎯 选择报告行文风格：", options, key="tab1_strategy")
@@ -228,22 +198,16 @@ with tab1:
             if templates_str:
                 style_instruction += GET_STYLE_FUSION(templates_str, report_type="single") + UI_CHART_MERMAID
 
-            # ================= 替换 tab1 下方的生成逻辑 =================
-            # 在 with tab1: 块的下面找到这部分，修改成传入 status_ui 并在最后接收 docx_path
             st.markdown("###### 🧠 深度研判报告生成中")
-            with st.status('专家团队正在全量阅卷，可能需要数分钟，请耐心...', expanded=True) as status_ui:
-                # 🌟 核心修改：将 status_ui 丢给后台，接收双重返回值
-                summary, docx_path = generate_final_summary(all_content, user_req=user_requirement_full, style_instruction=style_instruction, status_ui=status_ui)
-                status_ui.update(label="✅ 研判推演与物理封装完毕！", state="complete", expanded=False)
+            with st.spinner('红蓝军对抗与模板融合推演中...'):
+                summary = generate_final_summary(all_content, user_req=user_requirement_full, style_instruction=style_instruction)
                 
             st.success("🎉 研判报告已生成！")
             st.markdown("---")
             st.markdown(summary, unsafe_allow_html=True)
             
             final_md_content = f"# AI 深度洞察与业务研判报告\n\n{summary}\n\n---\n## 📚 附录：原始底层数据\n<details markdown=\"1\">\n<summary>👉 点击展开查看各页原始核心数据</summary>\n\n{all_content}\n</details>"
-            
-            # 🌟 将生成的 Word 路径传给导出渲染器
-            render_export_buttons(final_md_content, base_name, "研判报告", docx_path)
+            render_export_buttons(final_md_content, base_name, "研判报告")
 
 # ---------------------------------------------------------
 # 工作流 B：多公司竞品横评 
@@ -254,17 +218,7 @@ with tab2:
     
     col_req_b, col_tpl_b = st.columns([2, 1])
     with col_req_b:
-        user_requirement_b = st.text_area(
-            "🎯 自定义分析侧重点 (选填)",
-            placeholder=(
-                "不填则 AI 自动识别行业并切换竞品对比视角。\n"
-                "也可手动指定，例如：\n"
-                "• 重点对比各家在云服务市场上的战略差异\n"
-                "• 聚焦研发投入强度与技术护城河的差距"
-            ),
-            height=120,
-            key="tab2_req"
-        )
+        user_requirement_b = st.text_area("🎯 自定义分析侧重点 (选填)", placeholder="例如：请重点对比各家在云服务市场上的战略差异...", height=100, key="tab2_req")
     with col_tpl_b:
         options = ["🤖 AI 自动匹配金牌范例 (推荐)"] + get_available_templates()
         selected_strategy_b = st.selectbox("🎯 选择报告行文风格：", options, key="tab2_strategy")
@@ -320,17 +274,7 @@ with tab3:
     
     col_req_c, col_tpl_c = st.columns([2, 1])
     with col_req_c:
-        user_requirement_c = st.text_area(
-            "🎯 自定义分析侧重点 (选填)",
-            placeholder=(
-                "不填则 AI 自动识别行业并切换纵向演进分析视角。\n"
-                "也可手动指定，例如：\n"
-                "• 重点推演近三年研发投入与商业化成果的关系\n"
-                "• 聚焦核心业务增速的拐点年份与战略归因"
-            ),
-            height=120,
-            key="tab3_req"
-        )
+        user_requirement_c = st.text_area("🎯 自定义分析侧重点 (选填)", placeholder="例如：重点推演近三年研发投入的飙升幅度...", height=100, key="tab3_req")
     with col_tpl_c:
         options = ["🤖 AI 自动匹配金牌范例 (推荐)"] + get_available_templates()
         selected_strategy_c = st.selectbox("🎯 选择报告行文风格：", options, key="tab3_strategy")

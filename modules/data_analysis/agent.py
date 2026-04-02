@@ -197,7 +197,8 @@ def node_coder(state: AgentState) -> dict:
 
     prompt = ChatPromptTemplate.from_messages([
         ("system", DA_CODER_SYSTEM),
-        ("user", "分析需求：{query}\n\n【重要】已加载的真实数据集概览：\n{dataset_summary}\n\n【高级UI与可视化要求】：建议使用具有专业设计感的可视化方式（如 Seaborn 的 whitegrid 风格），确保图表带有清晰的标题、图例和坐标轴标签，并妥善处理中文显示。")
+        # 🌟 修复 1：严禁大模型自己修改字体，防止它覆盖系统的安全配置
+        ("user", "分析需求：{query}\n\n【重要】已加载的真实数据集概览：\n{dataset_summary}\n\n【高级UI与可视化要求】：建议使用具有专业设计感的可视化方式（如 Seaborn 的 whitegrid 风格）。【⚠️极其重要】：系统底层已自动配置了跨平台全局中文字体，你的代码中**绝对不要**再出现任何 `plt.rcParams['font.sans-serif']` 等配置字体的代码！直接画图即可。")
     ])
 
     raw_code = ""
@@ -220,18 +221,20 @@ def node_coder(state: AgentState) -> dict:
     FULLWIDTH_MAP = {"，": ",", "。": ".", "：": ":", "；": ";", "（": "(", "）": ")"}
     for zh, en in FULLWIDTH_MAP.items(): clean_code = clean_code.replace(zh, en)
     
-    # 彻底修复底层的 Monkey Patch，确保保存路径绝对正确且不污染下一次运行
+    # 🌟 修复 2：加入全平台中文字体全家桶（涵盖 Mac、Windows、Linux）
+    font_list = "['PingFang SC', 'Microsoft YaHei', 'SimHei', 'STHeiti', 'WenQuanYi Micro Hei', 'Arial Unicode MS']"
+    
     agg_prefix = (
         "import matplotlib\nimport matplotlib.pyplot as plt\n"
-        "try:\n    import seaborn as sns\n    sns.set_style('whitegrid', {'font.sans-serif': ['SimHei', 'Microsoft YaHei', 'Arial Unicode MS']})\nexcept:\n    pass\n"
+        f"try:\n    import seaborn as sns\n    sns.set_style('whitegrid', {{'font.sans-serif': {font_list}}})\nexcept:\n    pass\n"
         "plt.switch_backend('agg')\n"
-        "plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'Arial Unicode MS']\n"
+        f"plt.rcParams['font.sans-serif'] = {font_list}\n"
         "plt.rcParams['axes.unicode_minus'] = False\n"
         f"__chart_dir__ = r'{state['chart_dir']}'\n"
         "import os as __os__\n"
         "if hasattr(plt, '_original_savefig'):\n"
-        "    plt.savefig = plt._original_savefig\n" # 恢复原始状态
-        "plt._original_savefig = plt.savefig\n" # 备份
+        "    plt.savefig = plt._original_savefig\n" 
+        "plt._original_savefig = plt.savefig\n" 
         "def __patched_savefig__(fname, *a, **kw):\n"
         "    target = fname\n"
         "    if isinstance(fname, str) and not __os__.path.isabs(fname):\n"

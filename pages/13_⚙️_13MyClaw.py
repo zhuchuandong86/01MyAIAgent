@@ -173,8 +173,8 @@ st.set_page_config(page_title="ZClaw 智能执行器", page_icon="⚙️", layou
 st.title("⚙️ ZClaw: zclaw自主演进引擎")
 
 with st.sidebar:
-    st.header("📂 物理数据坞站 (沙盒模式)")
-    st.caption(f"工作区: `{WORKSPACE}`")
+    st.header("📂 数据坞站")
+    # st.caption(f"工作区: `{WORKSPACE}`")
 
     uploaded_file = st.file_uploader("文件投放入口", accept_multiple_files=False, label_visibility="collapsed")
     if uploaded_file:
@@ -190,7 +190,7 @@ with st.sidebar:
     st.info(f"👁️ **Vision**: {v_model or '未配置'}")
 
     st.markdown("---")
-    st.markdown("### 🔧 运行时工具统计")
+    # st.markdown("### 🔧 运行时工具统计")
     st.metric("已注册工具数", len(TOOL_DISPATCHER))
 
     with st.expander("查看已注册工具列表"):
@@ -203,7 +203,7 @@ with st.sidebar:
             st.write(f"{'🆕 ' if is_dynamic else ''}• `{name}`")
 
     st.markdown("---")
-    st.markdown("### 🗂️ 消息历史")
+    # st.markdown("### 🗂️ 消息历史")
     msg_count = len(st.session_state.get("zclaw_messages", [])) - 1
     st.metric("当前消息数", f"{max(0, msg_count)} / {MAX_MSG_HISTORY}")
     if msg_count >= MAX_MSG_HISTORY * 0.8:
@@ -269,17 +269,24 @@ if prompt := st.chat_input("向 zclaw下发任务，或指出它的错误..."):
 
             st.session_state.zclaw_messages.append(msg)
 
-            # 打印推理文本
-            if msg.content:
-                st.markdown(f"**🧠 第 {step + 1} 轮推演:**\n> {msg.content}")
-
-            # 无工具调用 → 任务完成
-            if not msg.tool_calls:
+            # 区分【中间思考】与【最终输出】
+            if msg.tool_calls:
+                # 场景 A：带有工具调用，说明是中间推演过程（思考）
+                if msg.content:
+                    # 写入 status 内部（浅蓝色背景）。任务完成后会连同工具日志一起被折叠隐藏
+                    status.markdown(f"**🧠 第 {step + 1} 轮推演思考:**")
+                    status.info(msg.content)
+            else:
+                # 场景 B：无工具调用，说明大模型得出了最终结论！
+                # 1. 关闭状态框，将之前所有的思考、日志全部折叠收起
                 status.update(label="✅ 任务完成", state="complete", expanded=False)
-                st.markdown(f"**最终汇报:** {msg.content}")
-                st.session_state.zclaw_history.append({"role": "assistant", "content": msg.content})
-
-                # 侧边栏工具数刷新提示（动态安装的工具才有意义）
+                
+                # 2. 将最终答案高亮展示在状态框外部的主对话流中
+                if msg.content:
+                    st.markdown(msg.content)
+                    st.session_state.zclaw_history.append({"role": "assistant", "content": msg.content})
+                
+                # 3. 提示新工具扩展
                 if len(TOOL_DISPATCHER) > 11:
                     st.info(f"🆕 本次任务后工具库扩展至 {len(TOOL_DISPATCHER)} 个工具！")
                 break

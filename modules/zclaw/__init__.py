@@ -18,9 +18,13 @@ from .vision_tools  import ask_vision
 from .memory_tools  import append_memory, search_memory, evaluate_and_prune_memory
 from .skill_tools   import list_skills, install_new_tool
 
+# 👇 新增：优雅导入 Anthropic 专家工具组
+from .anthropic_tools import ANTHROPIC_SCHEMA, ANTHROPIC_DISPATCHER
+
 # ── 注册中心（其他模块必须从这里导入，保证对象唯一）──────
 from ._registry import TOOL_DISPATCHER, ZCLAW_TOOLS_SCHEMA
 
+# 👇 增加这一行，只要项目一启动，20个技能就会瞬间完成强制装载！
 # ══════════════════════════════════════════════════════════
 # 工具说明书（大模型看到的 JSON Schema）
 # ══════════════════════════════════════════════════════════
@@ -238,6 +242,10 @@ _DISPATCHER = {
     "list_skills":               list_skills,
     "install_new_tool":          install_new_tool,
 }
+
+# 👇 新增：将 Anthropic 的近 20 个专家技能，完美合并进局部装配线
+_SCHEMA.extend(ANTHROPIC_SCHEMA)
+_DISPATCHER.update(ANTHROPIC_DISPATCHER)
 
 # ── In-place 填充注册中心（保证 skill_tools 热注册时引用一致）──
 ZCLAW_TOOLS_SCHEMA.extend(_SCHEMA)
