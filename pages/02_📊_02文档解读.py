@@ -182,8 +182,7 @@ with tab1:
                 "不填则 AI 自动识别文档类型并自适应分析视角。\n"
                 "也可手动指定侧重，例如：\n"
                 "• 财报：重点分析毛利率与现金流质量\n"
-                "• 政策文件：聚焦落地路径与关键时间节点\n"
-                "• 行业白皮书：提炼市场机会与竞争变量"
+                "• 政策文件：聚焦落地路径与关键时间节点"
             ),
             height=120
         )
@@ -191,31 +190,44 @@ with tab1:
         options = ["🤖 AI 自动匹配金牌范例 (推荐)"] + get_available_templates()
         selected_strategy = st.selectbox("🎯 选择报告行文风格：", options, key="tab1_strategy")
 
-    col_btn1, col_btn2 = st.columns(2)
-    with col_btn1: btn_extract_only = st.button("📝 仅提取数据底稿 (生成 MD)", use_container_width=True)
-    with col_btn2: btn_full_pipeline = st.button("🚀 开始全流程深度研判", type="primary", use_container_width=True)
+    # --- 🌟 核心修改：调整为三个功能按钮 ---
+    col_btn1, col_btn2, col_btn3 = st.columns(3)
+    with col_btn1: 
+        btn_extract_only = st.button("📝 仅提取数据底稿", use_container_width=True)
+    with col_btn2: 
+        btn_quick_scan = st.button("⚡ 快速智能研判", type="primary", use_container_width=True) # 新增：简单解读
+    with col_btn3: 
+        btn_full_pipeline = st.button("🚀 专家级深度研判", use_container_width=True) # 原功能：红蓝军
 
-    if btn_extract_only or btn_full_pipeline:
+    if btn_extract_only or btn_quick_scan or btn_full_pipeline:
         if not uploaded_files:
             st.warning("⚠️ 请先上传文件！")
             st.stop()
             
         status_container = st.container()
+        # 调用解析引擎，保留原有的缓存与指纹识别能力
         text_dict = parse_files_to_text_dict(uploaded_files, max_pages, status_container, use_cache)
         
         all_content = "\n".join(text_dict.values())
         base_name = os.path.splitext(uploaded_files[0].name)[0] if len(uploaded_files) == 1 else "多文件合并"
         
+        # 模式 1：仅提取底稿 (逻辑保持不变)
         if btn_extract_only:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             file_name_md = f"{base_name}_底稿_{timestamp}.md"
             temp_md_path = os.path.join(OUTPUT_DIR, file_name_md)
             with open(temp_md_path, "w", encoding="utf-8") as f: f.write(all_content)
-            st.info("💡 提取完毕！您可以直接下载该 Markdown 文件用于其他平台的预处理。")
+            st.info("💡 提取完毕！您可以直接下载该 Markdown 文件用于预处理。")
             with open(temp_md_path, "r", encoding="utf-8") as f:
                 st.download_button("⬇️ 一键下载 MD 数据底稿", data=f, file_name=file_name_md, mime="text/markdown", type="primary")
             st.stop()
             
+        # 模式 2 & 3：研判逻辑
+        templates_str = ""
+        ai_thinking_log = ""
+        analysis_mode = "deep" if btn_full_pipeline else "quick" # 判定传递给后端的模式
+        
+        # 只有在“深度研判”时才调用金牌模板检索（红蓝军演练背景）
         if btn_full_pipeline:
             with st.status("🧠 正在检索并研判人类金牌经验库...", expanded=True) as status:
                 templates_str, ai_thinking_log = get_style_templates(all_content, selected_strategy, status)
@@ -223,27 +235,50 @@ with tab1:
             if selected_strategy.startswith("🤖") and ai_thinking_log:
                 st.info(f"🤖 **大模型主编的选版笔记**：\n\n{ai_thinking_log}")
 
-            # 🌟 组合单文档指令
-            style_instruction = GET_USER_PRIORITY(user_requirement_full) + UI_COGNITIVE_SINGLE
-            if templates_str:
-                style_instruction += GET_STYLE_FUSION(templates_str, report_type="single") + UI_CHART_MERMAID
+        # 组合指令集
+        style_instruction = GET_USER_PRIORITY(user_requirement_full) + UI_COGNITIVE_SINGLE
+        if btn_full_pipeline and templates_str:
+            # 深度模式融合模板
+            style_instruction += GET_STYLE_FUSION(templates_str, report_type="single") + UI_CHART_MERMAID
+        elif btn_quick_scan:
+            # 快速模式追加简洁指令
+            style_instruction += "\n\n请直接基于文档进行结构化解读，无需执行红蓝军博弈推演。"
 
-            # ================= 替换 tab1 下方的生成逻辑 =================
-            # 在 with tab1: 块的下面找到这部分，修改成传入 status_ui 并在最后接收 docx_path
-            st.markdown("###### 🧠 深度研判报告生成中")
-            with st.status('专家团队正在全量阅卷，可能需要数分钟，请耐心...', expanded=True) as status_ui:
-                # 🌟 核心修改：将 status_ui 丢给后台，接收双重返回值
-                summary, docx_path = generate_final_summary(all_content, user_req=user_requirement_full, style_instruction=style_instruction, status_ui=status_ui)
-                status_ui.update(label="✅ 研判推演与物理封装完毕！", state="complete", expanded=False)
-                
-            st.success("🎉 研判报告已生成！")
-            st.markdown("---")
-            st.markdown(summary, unsafe_allow_html=True)
+        st.markdown("###### 🧠 研判报告生成中")
+        with st.status('专家团队正在阅卷，请耐心等待...', expanded=True) as status_ui:
+            # 🌟 核心修改：向 generate_final_summary 传递 mode 参数
+            summary, docx_path = generate_final_summary(
+                all_content, 
+                user_req=user_requirement_full, 
+                style_instruction=style_instruction, 
+                status_ui=status_ui,
+                mode=analysis_mode # 传递 quick 或 deep
+            )
+            status_ui.update(label="✅ 研判推演与物理封装完毕！", state="complete", expanded=False)
             
-            final_md_content = f"# AI 深度洞察与业务研判报告\n\n{summary}\n\n---\n## 📚 附录：原始底层数据\n<details markdown=\"1\">\n<summary>👉 点击展开查看各页原始核心数据</summary>\n\n{all_content}\n</details>"
-            
-            # 🌟 将生成的 Word 路径传给导出渲染器
-            render_export_buttons(final_md_content, base_name, "研判报告", docx_path)
+        st.success(f"🎉 {'专家级' if btn_full_pipeline else '快速'}研判报告已生成！")
+        st.markdown("---")
+        
+        # 🌟 直接渲染 summary，内部已经包含了 main.py 传回的折叠标签
+        st.markdown(summary, unsafe_allow_html=True)
+        
+        # 组装最终 MD 内容用于导出
+        report_title = "深度洞察与业务研判报告" if btn_full_pipeline else "快速智能解读报告"
+        
+        # 🌟 对附录数据也进行折叠优化
+        final_md_content = (
+            f"# AI {report_title}\n\n"
+            f"{summary}\n\n"
+            f"---\n"
+            f"## 📚 附录：原始底层数据\n"
+            f"<details>\n"
+            f"<summary>👉 点击展开查看各页 OCR 原始核心数据</summary>\n\n"
+            f"{all_content}\n"
+            f"</details>"
+        )
+        
+        # 渲染导出按钮
+        render_export_buttons(final_md_content, base_name, "研判报告", docx_path)
 
 # ---------------------------------------------------------
 # 工作流 B：多公司竞品横评 
