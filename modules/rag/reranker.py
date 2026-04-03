@@ -1,3 +1,4 @@
+# modules/rag/reranker.py
 import requests
 from typing import Sequence, Optional
 from langchain_core.documents import Document
@@ -5,7 +6,8 @@ from langchain_core.callbacks import Callbacks
 from langchain_classic.retrievers.document_compressors.base import BaseDocumentCompressor
 from langchain_classic.retrievers import ContextualCompressionRetriever
 
-# 【修复】：使用绝对导入
+# 【核心优化】：引入 settings
+from core.settings import settings
 from modules.rag.config import Config
 
 class InternalAPIReranker(BaseDocumentCompressor):
@@ -16,14 +18,15 @@ class InternalAPIReranker(BaseDocumentCompressor):
         texts = [doc.page_content for doc in documents]
         
         payload = {
-            "model": Config.RERANK_MODEL,
+            "model": settings.RERANK_MODEL, # 从 settings 读取重排模型
             "query": query,
             "documents": texts, 
             "top_n": int(Config.RERANK_TOP_K)
         }
         
-        headers = {"Authorization": f"Bearer {Config.INTERNAL_API_KEY}"}
-        url = f"{Config.INTERNAL_BASE_URL}/rerank"
+        # 从 settings 读取内网网关信息
+        headers = {"Authorization": f"Bearer {settings.API_KEY}"}
+        url = f"{settings.API_BASE}/rerank"
         
         try:
             response = requests.post(url, json=payload, headers=headers)
@@ -40,6 +43,7 @@ class InternalAPIReranker(BaseDocumentCompressor):
                     final_docs.append(doc)
             return final_docs
         except Exception as e:
+            # 接口调不通时的物理兜底：返回前 K 个原文档
             return documents[:Config.RERANK_TOP_K]
 
 def build_rerank_retriever(base_retriever):

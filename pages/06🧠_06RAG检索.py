@@ -1,22 +1,25 @@
+# pages/06🧠_06RAG检索.py
 import streamlit as st
 import os
 import json
 
-# 【必加】：引入全局路径管家
+# 【核心引入】：统一配置与兵工厂
 import core.paths
-from modules.rag.config import Config
+from core.settings import settings
+from core.llm_factory import get_llm
+from core.token_tracker import log_usage
+from core.prompts import RAG_SYSTEM_PROMPT
+
+# 保留 RAG 底层特有的路径配置与业务逻辑
+from modules.rag.config import Config 
 from modules.rag.file_processor import get_file_md5
 from modules.rag.batch_ingest import ingest_single_file, delete_single_file, rebuild_index_from_md
 from modules.rag.query_service import build_query_chain
-from langchain_community.vectorstores import FAISS
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from core.token_tracker import log_usage
-from langchain_community.callbacks.manager import get_openai_callback
-from core.prompts import RAG_SYSTEM_PROMPT
 
-# 🌟 新增：引入工厂与模板
-from core.llm_factory import get_llm
+from langchain_community.vectorstores import FAISS
+from langchain_openai import OpenAIEmbeddings
 from langchain_core.prompts import ChatPromptTemplate
+from langchain_community.callbacks.manager import get_openai_callback
 
 st.set_page_config(page_title="RAG 企业智库", page_icon="🧠", layout="wide")
 
@@ -31,8 +34,8 @@ rag_chain, retriever = get_rag_chain_and_retriever()
 
 def generate_ai_filename(original_name):
     try:
-        # 这里为了不干扰原来的逻辑，暂时保留原写法，后续也可换成 get_llm
-        llm = ChatOpenAI(model=Config.MODEL_NAME, api_key=Config.INTERNAL_API_KEY, base_url=Config.INTERNAL_BASE_URL, temperature=0.7)
+        # [核心优化]：彻底拥抱兵工厂，关闭流式以支持 invoke
+        llm = get_llm(model_name=settings.MODEL_TEXT, temperature=0.7, streaming=False)
         prompt = f"请根据原文件名 '{original_name}'，生成一个简短且规范的中文标题名（只输出名字本身，不要带扩展名，不要任何解释）。"
         new_name = llm.invoke(prompt).content.strip()
         ext = os.path.splitext(original_name)[-1]
@@ -43,9 +46,12 @@ def generate_ai_filename(original_name):
 def get_ingested_files():
     if os.path.exists(Config.DB_DIR) and os.path.exists(os.path.join(Config.DB_DIR, "index.faiss")):
         try:
+            # [核心优化]：使用全局 settings 注入 Embedding 配置
             embeddings = OpenAIEmbeddings(
-                model=Config.EMBEDDING_MODEL, api_key=Config.INTERNAL_API_KEY, 
-                base_url=Config.INTERNAL_BASE_URL, check_embedding_ctx_length=False 
+                model=settings.EMBEDDING_MODEL, 
+                api_key=settings.API_KEY, 
+                base_url=settings.API_BASE, 
+                check_embedding_ctx_length=False 
             )
             vectorstore = FAISS.load_local(Config.DB_DIR, embeddings, allow_dangerous_deserialization=True)
             sources = {}
@@ -68,11 +74,10 @@ def reload_knowledge_base():
         del st.session_state["rag_chain_obj"]
 
 # ==========================================
-# 侧边栏：文件管理与入库 (完全保留你的原版代码)
+# 侧边栏：文件管理与入库
 # ==========================================
 with st.sidebar:
     st.title("📚 知识库中心")
-    # st.subheader("📂 已存文档")
     ingested_data = get_ingested_files()
     
     if ingested_data:
@@ -157,57 +162,48 @@ if prompt := st.chat_input("关于您的文档，想问点什么？"):
     with st.chat_message("assistant"):
         if "rag_retriever_obj" in st.session_state and st.session_state.rag_retriever_obj is not None:  
             with st.spinner("全库极速检索中..."):
-                # 1. 仅调用 retriever 召回文档
                 source_docs = st.session_state.rag_retriever_obj.invoke(prompt)
                 
             if not source_docs:
                 st.info("未能在知识库中匹配到相关内容。")
                 st.stop()
                 
-            # 2. 构建带 [1][2] 角标的严格上下文
             context_str = ""
             for i, doc in enumerate(source_docs):
                 doc_name = os.path.basename(doc.metadata.get('source', '未知'))
                 page_info = f" - 第{doc.metadata.get('page')}页" if 'page' in doc.metadata else ""
                 context_str += f"[{i+1}] 来源文档: {doc_name}{page_info}\n内容片段: {doc.page_content}\n\n"
 
-            # 3. 设置极严苛的防幻觉 Prompt
-            # system_prompt = """你是一个严谨的企业级知识库问答助手。
-            # 请严格基于以下【检索到的知识片段】回答用户的问题。
-            
-            # 【核心规则】
-            # 1. 必须且只能使用给定的知识片段中的信息回答。严禁自己编造或凭空扩展！
-            # 2. **强制溯源标注**：在回答的每一个关键数据或结论后，必须使用方括号标注对应的信息来源编号，例如 [1], [2]。
-            
-            # 【检索到的知识片段】
-            # {context}"""
-            
             chat_template = ChatPromptTemplate.from_messages([
                 ("system", RAG_SYSTEM_PROMPT),
                 ("user", "{query}")
             ])
             
-            # 🌟 4. 使用第一步写好的 LLM 工厂获取大模型
-            llm = get_llm(model_name=Config.MODEL_NAME, temperature=0.1)
+            # [核心优化]：使用全局兵工厂与 settings
+            llm = get_llm(model_name=settings.MODEL_TEXT, temperature=0.1)
             
             placeholder = st.empty()
             full_response = ""
             
             with get_openai_callback() as cb:
                 try:
-                    # 5. 流式输出带有 [1][2] 的严谨答案
+                    count = 0
                     for chunk in (chat_template | llm).stream({"context": context_str, "query": prompt}):
-                        full_response += chunk.content
-                        placeholder.markdown(full_response + " ▌")
+                        if chunk.content:
+                            full_response += chunk.content
+                            count += 1
+                            # [核心修复]：防假死节流器，每 8 个 token 渲染一次
+                            if count % 8 == 0:
+                                placeholder.markdown(full_response + " ▌")
                     placeholder.markdown(full_response)
                     
-                    # 计费拦截
-                    log_usage("企业RAG智库(强溯源)", Config.MODEL_NAME, cb.total_tokens)
+                    # [核心修复]：Token 兜底算法
+                    tokens = cb.total_tokens if cb.total_tokens > 0 else int((len(context_str) + len(prompt) + len(full_response)) * 1.2)
+                    log_usage("企业RAG智库(强溯源)", settings.MODEL_TEXT, tokens)
                     
                 except Exception as e:
                     placeholder.error(f"❌ 生成失败: {e}")
                     
-            # 6. 立刻在当前气泡下方渲染溯源卡片，供用户对照
             with st.expander("🔍 展开查看原文 (点击核对真伪)"):
                 for idx, doc in enumerate(source_docs):
                     page_info = f" - 第{doc.metadata.get('page')}页" if 'page' in doc.metadata else ""

@@ -1,17 +1,35 @@
-"""
-全局工具注册中心 (_registry.py)
-────────────────────────────────────────────────────────────
-独立存放 TOOL_DISPATCHER 和 ZCLAW_TOOLS_SCHEMA，
-使 __init__.py 和 skill_tools.py 都能安全导入并原地修改，
-彻底规避循环导入问题。
+from modules.zclaw.coder_tools import delegate_to_coder, install_new_tool, SCHEMA as coder_schema
+from modules.zclaw.memory_tools import search_memory, append_memory, evaluate_and_prune_memory, SCHEMA as memory_schema
+from modules.zclaw.skill_tools import list_skills, SCHEMA as skill_schema
+from modules.zclaw.web_tools import search_web, read_webpage, SCHEMA as web_schema
+from modules.zclaw.system_tools import execute_bash, read_file, download_file, SCHEMA as system_schema # 🌟 增加 download_file
+from modules.zclaw.vision_tools import ask_vision, SCHEMA as vision_schema
+from modules.zclaw.scheduler_tools import create_cron_task, SCHEMA as scheduler_schema
 
-外部代码应从这里导入这两个对象的引用，
-然后直接对 dict/list 进行 in-place 操作（update / append），
-而不是重新赋值，否则其他模块持有的引用会失效。
-"""
+# 汇总所有原子 Schema
+RAW_SCHEMAS = (
+    coder_schema + memory_schema + skill_schema + 
+    web_schema + system_schema + vision_schema + 
+    scheduler_schema # 🌟 挂载闹钟工具
+)
 
-# 物理路由表：tool_name -> callable
-TOOL_DISPATCHER: dict = {}
+ZCLAW_TOOLS_SCHEMA = [
+    {"type": "function", "function": {"name": s["name"], "description": s["description"], "parameters": s["input_schema"]}}
+    for s in RAW_SCHEMAS
+]
 
-# 大模型看到的工具说明书（JSON Schema 列表）
-ZCLAW_TOOLS_SCHEMA: list = []
+TOOL_DISPATCHER = {
+    "delegate_to_coder": delegate_to_coder,
+    "install_new_tool": install_new_tool,
+    "search_memory": search_memory,
+    "append_memory": append_memory,
+    "evaluate_and_prune_memory": evaluate_and_prune_memory,
+    "list_skills": list_skills,
+    "search_web": search_web,
+    "read_webpage": read_webpage,
+    "execute_bash": execute_bash,
+    "read_file": read_file,
+    "download_file": download_file, # 🌟 挂载
+    "ask_vision": ask_vision,
+    "create_cron_task": create_cron_task
+}

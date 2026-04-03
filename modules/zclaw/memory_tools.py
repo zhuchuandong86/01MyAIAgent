@@ -1,11 +1,11 @@
 """
-memory_tools.py — Phase 1: 结构化记忆引擎
-────────────────────────────────────────────────────────────
-替代原先的纯文本 append，升级为：
-  - JSONL 结构化存储（带标签、使用计数、成功标记）
-  - 写入前自动去重（词汇重叠 > 70% 则跳过）
-  - 按需关键词检索（只把相关记忆注入 prompt，不再全量塞入）
-  - 定期剪枝（清除长期未被引用的低价值记忆）
+memory_tools.py — 结构化记忆引擎
+
+修复内容（对比旧版）：
+  - 存储格式：纯文本 append → JSONL（每行一条 JSON，带标签/时间戳/使用计数）
+  - 去重：无 → Jaccard 相似度 > 70% 自动跳过
+  - 检索：末尾截断 3000 字 → 按关键词相关性返回 top-k（随着记忆增多，早期经验不会消失）
+  - 剪枝：LLM 重写全文（高成本） → 按时间+使用频次精准清理（零 token 消耗）
   - 向后兼容：同步维护 experience_log.md 供人工查阅
 """
 
@@ -13,122 +13,109 @@ import os
 import json
 import time
 from datetime import datetime, timedelta
+import streamlit as st
 import core.paths
+from core.settings import settings
 
-WORKSPACE   = os.path.join(core.paths.GLOBAL_DATA_DIR, "zclaw_workspace")
-MEMORY_DB   = os.path.join(WORKSPACE, "memory.jsonl")          # 机读结构化库
-MEMORY_FILE = os.path.join(WORKSPACE, "experience_log.md")     # 人读 Markdown（兼容旧版）
+def get_user_workspace():
+    user = st.session_state.get("zclaw_user", "public")
+    ws = os.path.join(str(core.paths.GLOBAL_DATA_DIR), f"zclaw_workspace_{user}")
+    os.makedirs(ws, exist_ok=True)
+    return ws
 
+def _get_paths():
+    ws = get_user_workspace()
+    return (
+        os.path.join(ws, "memory.jsonl"),        # 机读：结构化记忆库
+        os.path.join(ws, "experience_log.md"),   # 人读：Markdown 版本
+    )
 
-# ──────────────────────────────────────────────────────────
-# 内部 IO 工具
-# ──────────────────────────────────────────────────────────
+# ── 内部 IO ───────────────────────────────────────────────
 
-def _load_memories() -> list[dict]:
-    if not os.path.exists(MEMORY_DB):
+def _load() -> list[dict]:
+    db, _ = _get_paths()
+    if not os.path.exists(db):
         return []
     memories = []
-    with open(MEMORY_DB, "r", encoding="utf-8") as f:
+    with open(db, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if line:
                 try:
                     memories.append(json.loads(line))
                 except json.JSONDecodeError:
-                    pass   # 跳过损坏行，不崩溃
+                    pass  # 跳过损坏行
     return memories
 
-
-def _save_memories(memories: list[dict]) -> None:
-    with open(MEMORY_DB, "w", encoding="utf-8") as f:
+def _save(memories: list[dict]) -> None:
+    db, _ = _get_paths()
+    with open(db, "w", encoding="utf-8") as f:
         for m in memories:
             f.write(json.dumps(m, ensure_ascii=False) + "\n")
 
-
-def _word_overlap(a: str, b: str) -> float:
-    """计算两个字符串的词汇重叠率（Jaccard 相似度）"""
-    wa = set(a.lower().split())
-    wb = set(b.lower().split())
+def _jaccard(a: str, b: str) -> float:
+    """词汇 Jaccard 相似度，用于去重判断"""
+    wa, wb = set(a.lower().split()), set(b.lower().split())
     if not wa or not wb:
         return 0.0
     return len(wa & wb) / len(wa | wb)
 
+# ── 公开工具函数 ───────────────────────────────────────────
 
-# ──────────────────────────────────────────────────────────
-# 公开工具函数（会被注册进 TOOL_DISPATCHER）
-# ──────────────────────────────────────────────────────────
-
-def append_memory(lesson: str, tags: str = "", success: bool = True) -> str:
+def append_memory(lesson: str) -> str:
     """
-    结构化写入一条经验记忆。
-    - lesson : 经验正文
-    - tags   : 逗号分隔的标签，如 "爬虫,反爬,requests"
-    - success: 是否为成功经验（失败教训传 False）
+    写入一条经验记忆。
+    修复：自动去重（完全相同 或 Jaccard > 70% 则跳过），防止记忆污染。
     """
-    os.makedirs(WORKSPACE, exist_ok=True)
-    memories = _load_memories()
-    lesson_stripped = lesson.strip()
+    memories = _load()
+    lesson   = lesson.strip()
 
-    # ── 去重检测 ──
+    # 去重检测
     for m in memories:
-        # 完全相同直接跳过
-        if m["lesson"].strip() == lesson_stripped:
-            return f"✅ 完全相同的记忆已存在，跳过重复写入。"
-        # 高度相似（> 70% Jaccard）也跳过
-        if len(lesson_stripped.split()) > 5 and _word_overlap(m["lesson"], lesson_stripped) > 0.70:
+        if m["lesson"].strip() == lesson:
+            return "✅ 完全相同的记忆已存在，跳过。"
+        if len(lesson.split()) > 5 and _jaccard(m["lesson"], lesson) > 0.70:
             return (
-                f"✅ 发现高度相似记忆（重叠率 "
-                f"{_word_overlap(m['lesson'], lesson_stripped):.0%}），已跳过，避免记忆污染。\n"
-                f"  └─ 已有记忆: {m['lesson'][:80]}"
+                f"✅ 发现高度相似记忆（重叠率 {_jaccard(m['lesson'], lesson):.0%}），已跳过。\n"
+                f"  └─ 已有: {m['lesson'][:80]}"
             )
-
-    tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
 
     entry = {
         "id":         int(time.time() * 1000),
-        "lesson":     lesson_stripped,
-        "tags":       tag_list,
-        "success":    success,
+        "lesson":     lesson,
         "use_count":  0,
         "last_used":  None,
         "created_at": datetime.now().isoformat(),
     }
-
     memories.append(entry)
-    _save_memories(memories)
+    _save(memories)
 
-    # 向后兼容：同步写入 Markdown
-    with open(MEMORY_FILE, "a", encoding="utf-8") as f:
-        prefix = "✅" if success else "❌教训"
-        f.write(f"- [{prefix}] {lesson_stripped}\n")
+    # 同步写 Markdown 供人工查阅
+    _, md = _get_paths()
+    with open(md, "a", encoding="utf-8") as f:
+        f.write(f"\n- {lesson}")
 
-    return (
-        f"✅ 经验已刻入结构化记忆库 "
-        f"[标签: {tag_list or '无'}]\n  └─ {lesson_stripped[:100]}"
-    )
+    return f"✅ 经验已写入记忆库\n  └─ {lesson[:100]}"
 
 
 def search_memory(query: str, top_k: int = 8) -> str:
     """
-    按需检索与 query 最相关的记忆条目（词汇重叠 + 使用频次加权）。
-    仅返回 top_k 条，供 System Prompt 按需注入，避免全量堆积。
+    检索与当前任务最相关的历史经验。
+    修复：不再返回末尾截断，改为按关键词相关性 + 使用频次加权排序，
+          只返回 top_k 条，早期经验不会因文件变大而消失。
     """
-    memories = _load_memories()
+    memories = _load()
     if not memories:
         return "（记忆库为空，尚无历史经验）"
 
-    query_words = set(query.lower().split())
+    qw = set(query.lower().split())
     scored: list[tuple[float, dict]] = []
 
     for m in memories:
-        lesson_words = set(m["lesson"].lower().split())
-        tag_words    = set(" ".join(m.get("tags", [])).lower().split())
-        all_words    = lesson_words | tag_words
-
-        overlap    = len(query_words & all_words)
-        use_bonus  = min(m.get("use_count", 0) * 0.15, 3.0)   # 使用次数奖励，最多 +3
-        score      = overlap + use_bonus
-
+        lw        = set(m["lesson"].lower().split())
+        overlap   = len(qw & lw)
+        use_bonus = min(m.get("use_count", 0) * 0.15, 3.0)  # 高频使用的经验额外加权
+        score     = overlap + use_bonus
         if score > 0:
             scored.append((score, m))
 
@@ -138,33 +125,29 @@ def search_memory(query: str, top_k: int = 8) -> str:
     scored.sort(key=lambda x: x[0], reverse=True)
     top = [m for _, m in scored[:top_k]]
 
-    # 更新引用计数
+    # 更新引用计数（被检索到说明有价值，use_count++）
     top_ids = {m["id"] for m in top}
     for m in memories:
         if m["id"] in top_ids:
             m["use_count"] = m.get("use_count", 0) + 1
             m["last_used"] = datetime.now().isoformat()
-    _save_memories(memories)
+    _save(memories)
 
-    lines = []
-    for m in top:
-        tag_str = f"[{', '.join(m['tags'])}] " if m.get("tags") else ""
-        flag    = "✅" if m.get("success", True) else "❌教训"
-        lines.append(f"- {flag} {tag_str}{m['lesson']}")
-
+    lines = [f"- {m['lesson']}" for m in top]
     return "\n".join(lines)
 
 
-def evaluate_and_prune_memory(days_threshold: int = 90, min_use_count: int = 1) -> str:
+def evaluate_and_prune_memory() -> str:
     """
-    Phase 4 记忆剪枝：清除超过 days_threshold 天未被引用且
-    use_count < min_use_count 的低价值记忆，防止记忆库无限膨胀。
+    精简记忆库。
+    修复：不再用 LLM 重写全文（高 token 消耗），
+          改为按规则清理：超过 90 天未引用 且 use_count < 2 的低价值记忆直接删除。
     """
-    memories = _load_memories()
+    memories = _load()
     if not memories:
-        return "记忆库为空，无需剪枝。"
+        return "记忆库为空，无需清理。"
 
-    cutoff = datetime.now() - timedelta(days=days_threshold)
+    cutoff = datetime.now() - timedelta(days=90)
     kept, pruned = [], []
 
     for m in memories:
@@ -175,22 +158,57 @@ def evaluate_and_prune_memory(days_threshold: int = 90, min_use_count: int = 1) 
             kept.append(m)
             continue
 
-        use_count = m.get("use_count", 0)
-
-        if last_used < cutoff and use_count < min_use_count:
+        if last_used < cutoff and m.get("use_count", 0) < 2:
             pruned.append(m)
         else:
             kept.append(m)
 
-    _save_memories(kept)
+    _save(kept)
 
     # 同步重建 Markdown
-    with open(MEMORY_FILE, "w", encoding="utf-8") as f:
-        f.write("# 全局经验法则与底层认知\n\n")
+    _, md = _get_paths()
+    user = st.session_state.get("zclaw_user", "public")
+    with open(md, "w", encoding="utf-8") as f:
+        f.write(f"# 【{user}】的专属经验\n\n")
         for m in kept:
             f.write(f"- {m['lesson']}\n")
 
     return (
         f"✅ 记忆剪枝完成：保留 {len(kept)} 条，"
-        f"清除 {len(pruned)} 条（超过 {days_threshold} 天未引用且使用次数 < {min_use_count}）。"
+        f"清除 {len(pruned)} 条（超 90 天未引用且使用次数 < 2）。"
     )
+
+
+SCHEMA = [
+    {
+        "name": "search_memory",
+        "description": "【任务开始前必须调用】检索与当前任务最相关的历史经验，避免重蹈覆辙。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "检索词，描述当前任务"}
+            },
+            "required": ["query"]
+        }
+    },
+    {
+        "name": "append_memory",
+        "description": "将排查出的重要经验永久写入记忆库。带自动去重，任务完成闭环后调用。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "lesson": {"type": "string", "description": "经验正文，清晰描述 what/why/how"}
+            },
+            "required": ["lesson"]
+        }
+    },
+    {
+        "name": "evaluate_and_prune_memory",
+        "description": "清理低价值记忆，防止记忆库膨胀。按使用频次和时间精准删除，零 token 消耗。",
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": []
+        }
+    }
+]

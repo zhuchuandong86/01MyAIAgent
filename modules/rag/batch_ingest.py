@@ -1,3 +1,4 @@
+# modules/rag/batch_ingest.py
 import os
 import shutil
 import json
@@ -7,7 +8,8 @@ from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_community.retrievers import BM25Retriever
 
-# 【修复】：使用绝对导入
+# 【核心优化】：引入全局配置
+from core.settings import settings
 from modules.rag.file_processor import get_file_md5, check_duplicate, mark_as_processed, parse_file_to_md
 from modules.rag.config import Config
 
@@ -35,7 +37,13 @@ def batch_ingest_folder(folder_path: str):
     with open(os.path.join(Config.DB_DIR, "bm25_index.pkl"), "wb") as f:
         pickle.dump(bm25_retriever, f)
 
-    embeddings = OpenAIEmbeddings(model=Config.EMBEDDING_MODEL, api_key=Config.INTERNAL_API_KEY, base_url=Config.INTERNAL_BASE_URL, check_embedding_ctx_length=False)
+    # 【核心优化】：使用统一 settings
+    embeddings = OpenAIEmbeddings(
+        model=settings.EMBEDDING_MODEL, 
+        api_key=settings.API_KEY, 
+        base_url=settings.API_BASE, 
+        check_embedding_ctx_length=False
+    )
     vectorstore = FAISS.from_documents(chunks, embeddings)
     vectorstore.save_local(Config.DB_DIR)
 
@@ -50,12 +58,9 @@ def ingest_single_file(file_path, force_overwrite=False):
     return "SUCCESS"
 
 # ==========================================
-# 🌟 核心修复：更强大的删除机制
+# 🌟 核心修复：更强大的删除机制 (保留原版逻辑)
 # ==========================================
 def delete_single_file(file_identifier):
-    """
-    兼顾 MD5 Hash 与 BaseName 的强力删除器
-    """
     records = {}
     if os.path.exists(Config.PROCESSED_RECORD_FILE):
         with open(Config.PROCESSED_RECORD_FILE, "r", encoding="utf-8") as f:
@@ -64,7 +69,6 @@ def delete_single_file(file_identifier):
     target_md5 = None
     file_path = None
 
-    # 1. 智能匹配：寻找是哪个文件需要删除
     if file_identifier in records:
         target_md5 = file_identifier
         file_path = records[file_identifier]
@@ -76,13 +80,11 @@ def delete_single_file(file_identifier):
                 file_path = v
                 break
 
-    # 2. 清理记录字典
     if target_md5:
         del records[target_md5]
         with open(Config.PROCESSED_RECORD_FILE, "w", encoding="utf-8") as f:
             json.dump(records, f, ensure_ascii=False, indent=2)
 
-    # 3. 🎯 将对应的 md 文件改名为 .bak (保留底稿，但使其脱离 RAG 视线)
     if file_path:
         base_name_to_del = os.path.splitext(os.path.basename(file_path))[0]
     else:
@@ -93,12 +95,10 @@ def delete_single_file(file_identifier):
 
     if os.path.exists(md_path):
         if os.path.exists(bak_path):
-            os.remove(bak_path) # 如果以前有同名的bak，先干掉
+            os.remove(bak_path) 
         os.rename(md_path, bak_path)
 
-    # 4. 强制重构 FAISS 库，彻底让这篇文档从前端 UI 和 AI 脑海中消失
     rebuild_index_from_md()
-
     return True
 
 def rebuild_index_from_md():
@@ -109,7 +109,6 @@ def rebuild_index_from_md():
     
     all_docs = []
     for filename in os.listdir(md_dir):
-        # 💡 这里只会读取 .md 结尾的文件，我们刚才改名为 .bak 的文件将完美被略过
         if filename.endswith(".md"):
             md_path = os.path.join(md_dir, filename)
             loader = TextLoader(md_path, encoding="utf-8")
@@ -119,7 +118,6 @@ def rebuild_index_from_md():
             all_docs.extend(docs)
             
     if not all_docs:
-        # 如果这是最后一份文档被删除了，直接清空数据库文件夹
         if os.path.exists(Config.DB_DIR):
             shutil.rmtree(Config.DB_DIR)
         return
@@ -127,13 +125,9 @@ def rebuild_index_from_md():
     text_splitter = MarkdownTextSplitter(chunk_size=Config.CHUNK_SIZE, chunk_overlap=Config.CHUNK_OVERLAP)
     chunks = text_splitter.split_documents(all_docs)
 
-    
-    # 👇👇👇 核心修复：给每个切片的文本强行加上文档来源作为“思想钢印”！ 👇👇👇
     for chunk in chunks:
         source_name = chunk.metadata.get("source", "未知文档")
         chunk.page_content = f"【此片段摘自文档：{source_name}】\n" + chunk.page_content
-    # 👆👆👆 修复结束 👆👆👆
-
 
     if os.path.exists(Config.DB_DIR):
         shutil.rmtree(Config.DB_DIR) 
@@ -144,10 +138,11 @@ def rebuild_index_from_md():
     with open(os.path.join(Config.DB_DIR, "bm25_index.pkl"), "wb") as f:
         pickle.dump(bm25_retriever, f)
         
+    # 【核心优化】：使用统一 settings
     embeddings = OpenAIEmbeddings(
-        model=Config.EMBEDDING_MODEL,
-        api_key=Config.INTERNAL_API_KEY,
-        base_url=Config.INTERNAL_BASE_URL,
+        model=settings.EMBEDDING_MODEL,
+        api_key=settings.API_KEY,
+        base_url=settings.API_BASE,
         check_embedding_ctx_length=False 
     )
     vectorstore = FAISS.from_documents(chunks, embeddings)

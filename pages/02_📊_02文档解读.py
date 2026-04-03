@@ -112,13 +112,19 @@ def parse_files_to_text_dict(uploaded_files, max_pages, ui_container, enable_cac
             result_dict[base_name] = file.getvalue().decode("utf-8")
         else:
             file_bytes = file.getvalue()
+            # 🌟 修复 1：使用完整的 MD5 确保无碰撞冲突
             file_md5 = hashlib.md5(file_bytes).hexdigest()
-            cache_file_path = os.path.join(MD_CACHE_DIR, f"{base_name}_{file_md5[:8]}.md")
+            
+            # 🌟 修复 2：彻底移除 base_name，实现“纯物理指纹寻址”。
+            # 🌟 修复 3：将 max_pages 加入缓存名！这样如果用户修改了提取页数，会强制重新解析对应的新页数，不会错误读取旧缓存。
+            cache_filename = f"{file_md5}_limit_{max_pages}.md"
+            cache_file_path = os.path.join(MD_CACHE_DIR, cache_filename)
             
             if enable_cache and os.path.exists(cache_file_path):
                 ui_container.success(f"⚡ 物理指纹匹配成功！命中全系统级缓存: {file.name}")
-                with open(cache_file_path, "r", encoding="utf-8") as f: result_dict[base_name] = f.read()
-                continue
+                with open(cache_file_path, "r", encoding="utf-8") as f: 
+                    result_dict[base_name] = f.read()
+                continue # 命中缓存，直接进入下一个文件
                 
             ui_container.warning(f"👁️ 正在激活视觉引擎，逐页提取新文件: {file.name} ...")
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")

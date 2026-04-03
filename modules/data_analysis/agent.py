@@ -3,9 +3,7 @@ import glob
 import tempfile
 from contextlib import redirect_stdout
 import pandas as pd
-from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
 import streamlit as st
 from datetime import datetime
 import os
@@ -15,14 +13,16 @@ import shutil
 import json
 import base64
 import urllib.parse
-from typing import TypedDict, List, Dict, Literal
+from typing import TypedDict, Literal
 from langgraph.graph import StateGraph, END
-from langgraph.checkpoint.memory import MemorySaver
 
-import ast          # [新增] Harness 静态代码检查
-import traceback    # [新增] Harness 完整堆栈捕获
+import ast
+import traceback
 
+# 统一兵工厂与配置
 import core.paths
+from core.settings import settings
+from core.llm_factory import get_llm
 from modules.data_analysis.reporter import generate_html_report
 from core.schemas import CodeReflection
 from core.prompts import (
@@ -31,75 +31,56 @@ from core.prompts import (
 )
 
 # ==========================================
-# [新增] Harness Engineering: 代码执行保护带沙箱
+# Harness Engineering: 代码执行保护带沙箱 (原封不动保留)
 # ==========================================
 class CodeExecutionHarness:
-    """
-    AI 代码执行保护带 (Harness)
-    负责：静态语法检查、危险代码拦截、安全沙箱执行、丰富错误堆栈捕获
-    """
     def __init__(self):
-        # 定义绝对不允许 AI 调用的高危系统指令
         self.forbidden_calls = ['system', 'popen', 'rmdir', 'remove', 'eval', 'exec']
 
     def pre_flight_check(self, code: str) -> str:
-        """执行前的 AST 静态检查，提前拦截低级错误和危险操作"""
         try:
             tree = ast.parse(code)
         except SyntaxError as e:
             return f"SyntaxError (代码存在基本语法错误): {e.msg} at line {e.lineno}"
         
-        # 扫描危险调用
         for node in ast.walk(tree):
             if isinstance(node, ast.Call):
                 if isinstance(node.func, ast.Name) and node.func.id in self.forbidden_calls:
                     return f"SecurityError: Harness 拦截到被禁止的系统级函数调用 `{node.func.id}`，请修改代码仅进行数据处理。"
                 elif isinstance(node.func, ast.Attribute) and node.func.attr in self.forbidden_calls:
                      return f"SecurityError: Harness 拦截到危险属性调用 `{node.func.attr}`。"
-        return "" # 静态检查通过
+        return ""
 
     def execute(self, code: str, dfs: dict) -> tuple[str, str]:
-        """
-        受控执行代码，返回 (标准输出字符串, 错误日志字符串)
-        """
-        # 第一道防线：静态检查
         static_error = self.pre_flight_check(code)
-        if static_error:
-            return "", static_error
+        if static_error: return "", static_error
             
         first_df_name = list(dfs.keys())[0] if dfs else None
         captured_output = io.StringIO()
         
-        # 准备受限的全局环境
         exec_env = {
-            "dfs": dfs, 
-            "df": dfs[first_df_name] if first_df_name else None, 
-            "pd": pd, 
-            "os": os, 
-            "re": re,
-            "__builtins__": __builtins__
+            "dfs": dfs, "df": dfs[first_df_name] if first_df_name else None, 
+            "pd": pd, "os": os, "re": re, "__builtins__": __builtins__
         }
         
-        # 第二道防线：捕获执行过程中的深层异常并截取堆栈
         try:
             import matplotlib
-            matplotlib.use("Agg") # 强制无头模式
+            matplotlib.use("Agg")
             with redirect_stdout(captured_output):
                 exec(code, exec_env)
             return captured_output.getvalue(), ""
         except Exception as e:
             tb_str = traceback.format_exc()
-            # 取最后 15 行堆栈，避免给 AI 传入过多无用 token
             lines = tb_str.split('\n')
             short_tb = '\n'.join(lines[-15:]) if len(lines) > 15 else tb_str
             error_msg = f"运行时异常 {type(e).__name__}: {str(e)}\n\n--- Harness 捕获到的详细堆栈 ---\n{short_tb}"
             return captured_output.getvalue(), error_msg
 
 # ==========================================
-# 0. 自动生成洞察机制 (Auto Insights) - 已修复转义
+# 0. 自动生成洞察机制
 # ==========================================
-def run_auto_insights(dfs: dict, api_key: str, api_base: str) -> dict:
-    llm = ChatOpenAI(temperature=0.1, model="deepseek-v3-0324", api_key=api_key, base_url=api_base)
+def run_auto_insights(dfs: dict) -> dict:
+    llm = get_llm(temperature=0.1, streaming=False) # 关闭流式以支持 invoke
     
     dataset_info_list = []
     for name, df in dfs.items():
@@ -124,16 +105,12 @@ def run_auto_insights(dfs: dict, api_key: str, api_base: str) -> dict:
         content = response.content.strip()
         json_match = re.search(r'\{.*\}', content, re.DOTALL)
         if json_match:
-            json_str = json_match.group(0)
-            return json.loads(json_str)
+            return json.loads(json_match.group(0))
         else:
-            raise ValueError("未能从大模型回复中提取出有效的 JSON 结构。")
+            raise ValueError("未能从模型回复中提取 JSON。")
     except Exception as e:
-        print(f"[ERROR] Auto-Insights 解析或请求失败: {e}")
-        return {
-            "summary": f"数据已就绪。自动画像生成遇到一点小问题，您可以手动输入分析需求。", 
-            "questions": [ "概括数据的核心指标", "绘制主要业务的趋势","分析数据分布与关系"]
-        }
+        print(f"[ERROR] Auto-Insights 解析失败: {e}")
+        return {"summary": "数据已就绪。您可以手动输入分析需求。", "questions": ["概括数据指标", "绘制业务趋势", "分析数据分布"]}
 
 # ==========================================
 # 1. 定义 LangGraph 全局状态字典
@@ -143,18 +120,13 @@ class AgentState(TypedDict):
     dataset_summary: str
     user_query: str
     chart_dir: str
-    api_key: str
-    api_base: str
-    
     plan: str
     generated_code: str
     execution_logs: str
     error_msg: str
-    
     reflections: list
     attempt: int
     max_retries: int
-    
     final_markdown: str
 
 # ==========================================
@@ -162,7 +134,7 @@ class AgentState(TypedDict):
 # ==========================================
 def node_planner(state: AgentState) -> dict:
     st.markdown("### 🗺️ Planner Agent 正在宏观审视所有表格，制定分析计划...")
-    llm = ChatOpenAI(temperature=0, model="deepseek-v3-0324", api_key=state["api_key"], base_url=state["api_base"])
+    llm = get_llm(temperature=0)
     prompt = ChatPromptTemplate.from_messages([
         ("system", DA_PLANNER_SYSTEM),
         ("user", "以下是本次加载的所有数据表大纲：\n\n{dataset_summary}\n\n用户需求: {query}")
@@ -179,26 +151,21 @@ def node_planner(state: AgentState) -> dict:
         plan_placeholder.markdown(f"```text\n{analysis_plan}\n```")
         st.success("✅ 多表联合分析计划制定完毕！")
     except Exception as e:
-        analysis_plan = "通用多表关联分析：趋势、对比、数据融合挖掘"
-        st.error(f"❌ Planner 调用失败，使用默认计划：{e}")
-        
+        analysis_plan = "通用关联分析：趋势、对比、数据融合"
+        st.error(f"❌ Planner 调用失败：{e}")
     return {"plan": analysis_plan}
 
 def node_coder(state: AgentState) -> dict:
     st.markdown(f"### 👨‍💻 程序员 Agent 开始跨表写代码 (第 {state['attempt']+1}/{state['max_retries']} 次)")
-    llm = ChatOpenAI(temperature=0, model="deepseek-v3-0324", api_key=state["api_key"], base_url=state["api_base"])
+    llm = get_llm(temperature=0)
     
     memory_str = "无历史报错，首次尝试。"
     if state["reflections"]:
-        memory_str = "\n".join([
-            f"【第{m['attempt']}次尝试 Harness 反馈】\n  报错: {m['error']}\n  对策: {m['fix_strategy']}"
-            for m in state["reflections"]
-        ])
+        memory_str = "\n".join([f"报错: {m['error']}\n对策: {m['fix_strategy']}" for m in state["reflections"]])
 
     prompt = ChatPromptTemplate.from_messages([
         ("system", DA_CODER_SYSTEM),
-        # 🌟 修复 1：严禁大模型自己修改字体，防止它覆盖系统的安全配置
-        ("user", "分析需求：{query}\n\n【重要】已加载的真实数据集概览：\n{dataset_summary}\n\n【高级UI与可视化要求】：建议使用具有专业设计感的可视化方式（如 Seaborn 的 whitegrid 风格）。【⚠️极其重要】：系统底层已自动配置了跨平台全局中文字体，你的代码中**绝对不要**再出现任何 `plt.rcParams['font.sans-serif']` 等配置字体的代码！直接画图即可。")
+        ("user", "分析需求：{query}\n\n【数据集概览】：\n{dataset_summary}\n\n【UI与可视化】：建议用 Seaborn 的 whitegrid 风格。【⚠️警告】：系统底层已自动配置中文字体，代码中**绝对不要**再出现任何 `plt.rcParams['font.sans-serif']` 等配置！")
     ])
 
     raw_code = ""
@@ -213,27 +180,31 @@ def node_coder(state: AgentState) -> dict:
             count += 1
             if count % 8 == 0: code_placeholder.markdown(f"```python\n{raw_code}▌\n```")
         code_placeholder.markdown(f"```python\n{raw_code}\n```")
-        st.info("⚙️ 代码接收完毕，准备丢入 Harness 沙箱执行...")
     except Exception as e:
         st.error(f"API请求异常: {e}")
 
     clean_code = raw_code.replace("```python", "").replace("```", "").strip()
-    FULLWIDTH_MAP = {"，": ",", "。": ".", "：": ":", "；": ";", "（": "(", "）": ")"}
-    for zh, en in FULLWIDTH_MAP.items(): clean_code = clean_code.replace(zh, en)
+    for zh, en in {"，": ",", "。": ".", "：": ":", "；": ";", "（": "(", "）": ")"}.items(): 
+        clean_code = clean_code.replace(zh, en)
     
-    # 🌟 修复 2：加入全平台中文字体全家桶（涵盖 Mac、Windows、Linux）
-    font_list = "['PingFang SC', 'Microsoft YaHei', 'SimHei', 'STHeiti', 'WenQuanYi Micro Hei', 'Arial Unicode MS']"
-    
+    # [核心修复]：动态加载项目自带中文字体，彻底绕过系统环境差异与 Matplotlib 缓存Bug
     agg_prefix = (
         "import matplotlib\nimport matplotlib.pyplot as plt\n"
-        f"try:\n    import seaborn as sns\n    sns.set_style('whitegrid', {{'font.sans-serif': {font_list}}})\nexcept:\n    pass\n"
+        "import matplotlib.font_manager as fm\n"
+        "import os as __os__\n"
+        "# 尝试挂载项目级私有字体\n"
+        "__font_path = __os__.path.join(__os__.getcwd(), 'core', 'fonts', 'SimHei.ttf')\n"
+        "__font_name = 'SimHei'\n"
+        "if __os__.path.exists(__font_path):\n"
+        "    fm.fontManager.addfont(__font_path)\n"
+        "    __font_name = fm.FontProperties(fname=__font_path).get_name()\n"
+        "__font_list = [__font_name, 'PingFang SC', 'Microsoft YaHei', 'SimHei', 'STHeiti', 'WenQuanYi Micro Hei']\n"
+        "try:\n    import seaborn as sns\n    sns.set_style('whitegrid', {'font.sans-serif': __font_list})\nexcept:\n    pass\n"
         "plt.switch_backend('agg')\n"
-        f"plt.rcParams['font.sans-serif'] = {font_list}\n"
+        "plt.rcParams['font.sans-serif'] = __font_list\n"
         "plt.rcParams['axes.unicode_minus'] = False\n"
         f"__chart_dir__ = r'{state['chart_dir']}'\n"
-        "import os as __os__\n"
-        "if hasattr(plt, '_original_savefig'):\n"
-        "    plt.savefig = plt._original_savefig\n" 
+        "if hasattr(plt, '_original_savefig'):\n    plt.savefig = plt._original_savefig\n" 
         "plt._original_savefig = plt.savefig\n" 
         "def __patched_savefig__(fname, *a, **kw):\n"
         "    target = fname\n"
@@ -246,8 +217,6 @@ def node_coder(state: AgentState) -> dict:
 
 def node_executor(state: AgentState) -> dict:
     st.markdown("### 🛡️ Harness 沙箱验证与运行代码中...")
-    
-    # [改造点] 实例化 Harness 保护带
     harness = CodeExecutionHarness()
     stdout_logs, error_msg = harness.execute(state["generated_code"], state["dfs"])
     
@@ -258,18 +227,14 @@ def node_executor(state: AgentState) -> dict:
         else:
             st.warning("⚠️ Harness 提示：代码执行成功，但未输出任何分析数据，且未生成图片！")
     else:
-        st.error("❌ Harness 拦截到异常！已抓取堆栈日志并准备抛回给 AI 进行反思...")
+        st.error("❌ Harness 拦截到异常！已抓取堆栈日志并抛回给 AI 反思...")
         with st.expander("查看详细报错", expanded=False):
             st.code(error_msg)
             
-    return {
-        "execution_logs": stdout_logs,
-        "error_msg": error_msg,
-        "attempt": state["attempt"] + 1
-    }
+    return {"execution_logs": stdout_logs, "error_msg": error_msg, "attempt": state["attempt"] + 1}
 
 def node_reflector(state: AgentState) -> dict:
-    llm = ChatOpenAI(temperature=0, model="deepseek-v3-0324", api_key=state["api_key"], base_url=state["api_base"])
+    llm = get_llm(temperature=0, streaming=False) # 必须关闭流式以使用 structured_output
     prompt = ChatPromptTemplate.from_messages([
         ("system", DA_REFLECT_SYSTEM),
         ("user", "报错信息: {error}\n\n出错代码片段:\n{code}")
@@ -281,18 +246,15 @@ def node_reflector(state: AgentState) -> dict:
             prompt.format_messages(error=state["error_msg"], code=state["generated_code"][-2000:])
         )
         reflection = {
-            "attempt": state["attempt"], 
-            "error": state["error_msg"], 
-            "root_cause": reflection_obj.root_cause, 
-            "fix_strategy": reflection_obj.fix_strategy, 
+            "attempt": state["attempt"], "error": state["error_msg"], 
+            "root_cause": reflection_obj.root_cause, "fix_strategy": reflection_obj.fix_strategy, 
             "avoid": reflection_obj.avoid
         }
-    except Exception as parse_e:
+    except Exception:
         reflection = {
             "attempt": state["attempt"], "error": state["error_msg"],
             "root_cause": "解析失败", "fix_strategy": "请检查变量名或使用 try-except 跳过错误", "avoid": "避免复杂链式调用"
         }
-    
     return {"reflections": state["reflections"] + [reflection]}
 
 def node_analyst(state: AgentState) -> dict:
@@ -300,7 +262,7 @@ def node_analyst(state: AgentState) -> dict:
         return {"final_markdown": f"<h2>⚠️ 数据分析中断</h2><pre>{state['error_msg']}</pre>"}
         
     st.markdown("### 🧑‍💼 分析师 Agent 正在撰写最终多表融合洞察报告...")
-    llm = ChatOpenAI(temperature=0.3, model="deepseek-v3-0324", api_key=state["api_key"], base_url=state["api_base"])
+    llm = get_llm(temperature=0.3)
     prompt = ChatPromptTemplate.from_messages([("system", DA_ANALYST_SYSTEM), ("user", "原需求：{query}")])
     
     generated_charts = glob.glob(os.path.join(state["chart_dir"], "chart_*.png"))
@@ -324,23 +286,22 @@ def node_analyst(state: AgentState) -> dict:
         final_markdown = match.group(1).strip() if match else raw_report.strip()
     except Exception as e:
         final_markdown = f"报告生成失败: {e}"
-        
     return {"final_markdown": final_markdown}
 
 def router_after_execution(state: AgentState) -> Literal["reflector", "analyst"]:
-    if state["error_msg"] and state["attempt"] < state["max_retries"]:
-        return "reflector"
+    if state["error_msg"] and state["attempt"] < state["max_retries"]: return "reflector"
     return "analyst"
 
 # ==========================================
 # 3. 核心主入口：构建与运行 Graph
 # ==========================================
-def run_agent_pipeline(dfs: dict, user_query: str, api_key: str, api_base: str):
+def run_agent_pipeline(dfs: dict, user_query: str):
     current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
     report_out = os.path.join(str(core.paths.GLOBAL_DATA_DIR), f"数据分析报告_{current_time}.html")
 
     cleaned_dfs = {}
     dataset_info_list = []
+    # [原有清洗逻辑保留]
     for table_name, df in dfs.items():
         df.dropna(how='all', inplace=True)
         df.dropna(axis=1, how='all', inplace=True)
@@ -353,22 +314,21 @@ def run_agent_pipeline(dfs: dict, user_query: str, api_key: str, api_base: str):
                 df[col] = df[col].replace(['-', '--', '无', 'N/A', 'NA', 'null', ''], pd.NA)
                 temp_col = df[col].astype(str).str.replace(r'[¥$,\s]', '', regex=True)
                 converted = pd.to_numeric(temp_col, errors='coerce')
-                if converted.notna().mean() > 0.5:
-                    df[col] = converted
+                if converted.notna().mean() > 0.5: df[col] = converted
                     
         cleaned_dfs[table_name] = df
         cols_str = ", ".join(df.columns)
         sample_str = df.head(3).fillna("空值(NaN)").to_string()
-        dataset_info_list.append(f"📦【表名】: {table_name}\n【字段】: {cols_str}\n【数据样本】:\n{sample_str}\n")
+        dataset_info_list.append(f"📦【表名】: {table_name}\n【字段】: {cols_str}\n【样本】:\n{sample_str}\n")
         
     if not cleaned_dfs:
-        error_html = "<h2 style='color:red;'>❌ 数据处理失败</h2><p>所有上传的表格均无有效数据。</p>"
+        error_html = "<h2 style='color:red;'>❌ 数据处理失败</h2><p>表格无有效数据。</p>"
         with open(report_out, "w", encoding="utf-8") as f: f.write(error_html)
         return error_html, report_out, {}
         
     dataset_summary = "\n".join(dataset_info_list)
     if not user_query or not user_query.strip():
-        user_query = "请对环境中加载的所有数据表进行全面扫描。尝试寻找可以关联（merge）的维度进行深入挖掘，并分别输出核心图表。"
+        user_query = "扫描所有数据表，寻找可关联挖掘的维度并输出图表。"
 
     chart_dir = tempfile.mkdtemp(prefix="agent_charts_")
 
@@ -378,7 +338,6 @@ def run_agent_pipeline(dfs: dict, user_query: str, api_key: str, api_base: str):
     workflow.add_node("executor", node_executor)
     workflow.add_node("reflector", node_reflector)
     workflow.add_node("analyst", node_analyst)
-    
     workflow.set_entry_point("planner")
     workflow.add_edge("planner", "coder")
     workflow.add_edge("coder", "executor")
@@ -390,35 +349,25 @@ def run_agent_pipeline(dfs: dict, user_query: str, api_key: str, api_base: str):
 
     initial_state = {
         "dfs": cleaned_dfs, "dataset_summary": dataset_summary, "user_query": user_query,
-        "chart_dir": chart_dir, "api_key": api_key, "api_base": api_base,
-        "plan": "", "generated_code": "", "execution_logs": "", "error_msg": "",
-        "reflections": [], "attempt": 0, "max_retries": 3, "final_markdown": ""
+        "chart_dir": chart_dir, "plan": "", "generated_code": "", "execution_logs": "", 
+        "error_msg": "", "reflections": [], "attempt": 0, "max_retries": 3, "final_markdown": ""
     }
     
-    thread_config = {"configurable": {"thread_id": "demo_user_task_001"}}
     final_state = app.invoke(initial_state)
-
     final_markdown = final_state["final_markdown"]
     
     if final_state["error_msg"] and final_state["attempt"] >= final_state["max_retries"]:
         with open(report_out, "w", encoding="utf-8") as f: f.write(final_markdown)
         return final_markdown, report_out, {} 
         
-    # =========================================================
-    # 【核心修复】将图表从临时沙箱目录拷出，必须在 generate_html_report 之前！
-    # 这样 reporter.py 才能在当前目录下找到并注入 Base64
-    # =========================================================
+    # [原有 HTML 生成与 Base64 注入逻辑保留]
     for src in glob.glob(os.path.join(chart_dir, "chart_*.png")):
-        img_filename = os.path.basename(src)
-        shutil.copy2(src, img_filename) 
+        shutil.copy2(src, os.path.basename(src)) 
 
-    # 现在执行渲染，reporter.py 就能完美捕获图片了
     html_string = generate_html_report(final_markdown, report_out)
 
-    # 暴力替换第二道防线（防止大模型没有用 [CHART_1] 而是直接写了 Markdown 图片语法）
     for src in glob.glob(os.path.join(chart_dir, "chart_*.png")):
         img_filename = os.path.basename(src)
-        
         with open(src, "rb") as image_file:
             encoded_string = base64.b64encode(image_file.read()).decode()
         b64_src = f"data:image/png;base64,{encoded_string}"
@@ -427,19 +376,16 @@ def run_agent_pipeline(dfs: dict, user_query: str, api_key: str, api_base: str):
         html_string = html_string.replace(urllib.parse.quote(img_filename), b64_src)
         html_string = html_string.replace(f"./{img_filename}", b64_src)
 
-    # 将最终完整替换好的 HTML 重新保存覆盖
-    with open(report_out, "w", encoding="utf-8") as f:
-        f.write(html_string)
+    with open(report_out, "w", encoding="utf-8") as f: f.write(html_string)
 
     return html_string, report_out, {"plan": final_state["plan"], "data": final_state["execution_logs"]}
 
 # ==========================================
 # 4. 追问模块
 # ==========================================
-def run_followup_chat(user_query: str, chat_history: list, context_data: dict, api_key: str, api_base: str):
-    llm_chat = ChatOpenAI(temperature=0.4, model="deepseek-v3-0324", api_key=api_key, base_url=api_base)
+def run_followup_chat(user_query: str, chat_history: list, context_data: dict):
+    llm_chat = get_llm(temperature=0.4)
     messages = [("system", DA_FOLLOWUP_SYSTEM.format(data=context_data.get("data", "无数据")))]
     for msg in chat_history: messages.append((msg["role"], msg["content"]))
     messages.append(("user", user_query))
-    prompt = ChatPromptTemplate.from_messages(messages)
-    return (prompt | llm_chat).stream({})
+    return (ChatPromptTemplate.from_messages(messages) | llm_chat).stream({})

@@ -1,18 +1,21 @@
 # core/llm_factory.py
+from openai import OpenAI
 from langchain_openai import ChatOpenAI
 from core.settings import settings
 
+def get_openai_client() -> OpenAI:
+    """
+    [新增] 全局统一的原生 OpenAI 客户端工厂
+    适用于：Agent Tool Calling、高并发异步推理等底层场景
+    """
+    return OpenAI(
+        api_key=settings.API_KEY,
+        base_url=settings.API_BASE
+    )
+
 def get_llm(model_name: str = None, temperature: float = 0.1, streaming: bool = True) -> ChatOpenAI:
-    """
-    全局大模型实例化工厂 (LLM Factory)
-    
-    :param model_name: 模型名称，默认回退到 settings.MODEL_TEXT
-    :param temperature: 温度参数，默认 0.1 保证输出的严谨性
-    :param streaming: 是否强制开启流式输出与 Token 计费打点，默认 True
-    :return: 实例化好的 ChatOpenAI 对象
-    """
-    # 自动选择模型，优先使用传入的模型，否则使用全局默认配置
-    target_model = model_name or settings.MODEL_TEXT or "deepseek-v3-0324"
+    # 自动选择模型，优先使用传入的，否则回退到 settings 中的默认配置
+    target_model = model_name or settings.MODEL_TEXT
     
     # 统一封装底层参数
     model_kwargs = {}
@@ -26,5 +29,6 @@ def get_llm(model_name: str = None, temperature: float = 0.1, streaming: bool = 
         api_key=settings.API_KEY,
         base_url=settings.API_BASE,
         temperature=temperature,
+        streaming=streaming,  # 👈 【核心修复】：必须显式传递此参数激活底层流式句柄
         model_kwargs=model_kwargs
     )

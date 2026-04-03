@@ -1,9 +1,8 @@
 import streamlit as st
-import os
 import json
 from openai import OpenAI
 
-import core.paths
+# 统一从全局设置导入，剔除 os.getenv
 from core.settings import settings
 from core.token_tracker import log_usage
 from modules.zclaw._registry import ZCLAW_TOOLS_SCHEMA, TOOL_DISPATCHER
@@ -11,10 +10,10 @@ from modules.zclaw._registry import ZCLAW_TOOLS_SCHEMA, TOOL_DISPATCHER
 st.set_page_config(page_title="AI 双核对话大厅", page_icon="💬", layout="wide")
 
 # =========================================================
-# 🛡️ 竞技场配置：选取两个对打的模型与基础工具
+# 🛡️ 竞技场配置：选取两个对打的模型与基础工具 (统一使用 settings 单例)
 # =========================================================
-MODEL_A = os.getenv("MODEL_BLUE", "deepseek-v3-0324")
-MODEL_B = os.getenv("MODEL_RED", "deepseek-v3-0324") 
+MODEL_A = settings.MODEL_BLUE
+MODEL_B = settings.MODEL_RED 
 
 # 只保留安全的基础工具，防止大模型在聊天时误删代码
 ALLOWED_TOOL_NAMES = ["search_web", "read_webpage", "ask_vision", "read_file", "search_memory"]
@@ -61,7 +60,7 @@ for msg in st.session_state.display_msgs:
                 st.markdown(msg.get("content_B", ""))
 
 # =========================================================
-# ⚙️ 核心特工执行器 (支持工具调用)
+# ⚙️ 核心特工执行器 (增加 JSON 容错与异常拦截)
 # =========================================================
 def run_lobby_agent(client, model, messages, tools, ui_container, avatar, icon):
     with ui_container:
@@ -71,12 +70,18 @@ def run_lobby_agent(client, model, messages, tools, ui_container, avatar, icon):
             final_text = "⚠️ 生成失败"
             
             for step in range(4): # 最多允许连续 4 次工具调用
-                res = client.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    tools=tools if tools else None,
-                    temperature=0.7
-                )
+                try:
+                    res = client.chat.completions.create(
+                        model=model,
+                        messages=messages,
+                        tools=tools if tools else None,
+                        temperature=0.7
+                    )
+                except Exception as e:
+                    status.update(label="❌ API 调用异常", state="error")
+                    res_box.error(f"模型请求失败: {str(e)}")
+                    return f"系统异常: {str(e)}"
+
                 msg = res.choices[0].message
                 
                 # 安全地将对象转为字典存入记忆
@@ -86,9 +91,29 @@ def run_lobby_agent(client, model, messages, tools, ui_container, avatar, icon):
                 if msg.tool_calls:
                     for tool in msg.tool_calls:
                         func_name = tool.function.name
-                        args = json.loads(tool.function.arguments)
+                        raw_args = tool.function.arguments
+                        
+                        # [优化点]：增加极其重要的 JSON 解析容错，防止大模型幻觉导致程序崩溃
+                        try:
+                            args = json.loads(raw_args)
+                        except json.JSONDecodeError:
+                            err_msg = f"无法解析工具参数，请重新生成合法的 JSON 格式。你输出的参数为: {raw_args}"
+                            status.write(f"⚠️ 工具参数解析错误: `{func_name}`")
+                            messages.append({
+                                "role": "tool", 
+                                "tool_call_id": tool.id, 
+                                "content": err_msg
+                            })
+                            continue # 将错误信息塞回给模型，让它在下一轮自我纠正
+                            
                         status.write(f"⚙️ 调度工具: `{func_name}`")
-                        action_res = TOOL_DISPATCHER.get(func_name, lambda **kw: "无权限调用此工具")(**args)
+                        
+                        # 执行工具捕获异常，防止工具内部崩溃波及主线程
+                        try:
+                            action_res = TOOL_DISPATCHER.get(func_name, lambda **kw: "无权限调用此工具")(**args)
+                        except Exception as ex:
+                            action_res = f"工具执行内部报错: {str(ex)}"
+                            status.write(f"❌ `{func_name}` 执行失败")
                         
                         # 把工具结果塞回上下文
                         messages.append({
@@ -96,15 +121,15 @@ def run_lobby_agent(client, model, messages, tools, ui_container, avatar, icon):
                             "tool_call_id": tool.id, 
                             "content": str(action_res)
                         })
-                    continue # 携带结果进行下一轮推理
+                    continue # 携带所有工具的结果进行下一轮推理
                 else:
                     status.update(label=f"✅ {model} 响应完毕", state="complete", expanded=False)
                     res_box.markdown(msg.content)
                     final_text = msg.content
                     
-                    # 记账
+                    # 记账 (复用全局统一的 settings 里的 token 跟踪)
                     if hasattr(res, 'usage') and res.usage:
-                        log_usage("Lobby-Arena", model, res.usage.total_tokens)
+                        log_usage("对话大厅", model, res.usage.total_tokens)
                     break
                     
             return final_text
@@ -121,6 +146,7 @@ if prompt := st.chat_input("问点什么... (支持搜索、图片解析、上�
     with st.chat_message("user"):
         st.markdown(prompt)
         
+    # 统一使用配置单例初始化客户端
     client = OpenAI(api_key=settings.API_KEY, base_url=settings.API_BASE)
     col1, col2 = st.columns(2)
     

@@ -20,7 +20,8 @@ class Settings:
     MODEL_EDITOR = os.getenv("MODEL_EDITOR", "deepseek-v3-0324")
     MODEL_CODER=os.getenv("MODEL_CODER","qwen3-coder-480b-a35b-instruct")
     proxy_url=os.getenv("proxy_url")
-    
+    MODEL_RTS=os.getenv("qwen2.5-omni")
+    tavily_key=os.getenv("tavily_key")
     # 向量与重排模型配置
     EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "bge-m3") 
     RERANK_MODEL = os.getenv("RERANK_MODEL", "bge-reranker-v2-m3")

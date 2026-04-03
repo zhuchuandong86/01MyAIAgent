@@ -5,6 +5,7 @@ import json
 import time
 from datetime import datetime
 from openai import OpenAI
+from modules.zclaw.web_tools import search_web, read_webpage
 
 import core.paths
 from core.settings import settings
