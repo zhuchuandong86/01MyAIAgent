@@ -102,7 +102,11 @@ def render_export_buttons(summary_md, base_filename, report_type="报告", docx_
 
 
 def parse_files_to_text_dict(uploaded_files, max_pages, ui_container, enable_cache):
+    import os
+    import hashlib
+    from datetime import datetime
     result_dict = {}
+    
     for file in uploaded_files:
         ext = os.path.splitext(file.name)[1].lower()
         base_name = os.path.splitext(file.name)[0]
@@ -112,11 +116,10 @@ def parse_files_to_text_dict(uploaded_files, max_pages, ui_container, enable_cac
             result_dict[base_name] = file.getvalue().decode("utf-8")
         else:
             file_bytes = file.getvalue()
-            # 🌟 修复 1：使用完整的 MD5 确保无碰撞冲突
+            # 🌟 你的原版逻辑保留：使用完整的 MD5 确保无碰撞冲突
             file_md5 = hashlib.md5(file_bytes).hexdigest()
             
-            # 🌟 修复 2：彻底移除 base_name，实现“纯物理指纹寻址”。
-            # 🌟 修复 3：将 max_pages 加入缓存名！这样如果用户修改了提取页数，会强制重新解析对应的新页数，不会错误读取旧缓存。
+            # 🌟 你的原版逻辑保留：纯物理指纹寻址，包含 max_pages
             cache_filename = f"{file_md5}_limit_{max_pages}.md"
             cache_file_path = os.path.join(MD_CACHE_DIR, cache_filename)
             
@@ -126,44 +129,129 @@ def parse_files_to_text_dict(uploaded_files, max_pages, ui_container, enable_cac
                     result_dict[base_name] = f.read()
                 continue # 命中缓存，直接进入下一个文件
                 
-            ui_container.warning(f"👁️ 正在激活视觉引擎，逐页提取新文件: {file.name} ...")
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            safe_filename = f"{timestamp}_{file.name}"
-            file_path = os.path.join(UPLOAD_DIR, safe_filename)
-            
-            with open(file_path, "wb") as f: f.write(file_bytes)
-                
-            image_paths = []
-            if ext == '.pdf':
-                image_paths.extend(convert_pdf_to_images(file_path, TEMP_IMG_DIR, max_pages))
-            else:
-                image_paths.append(file_path)
-                
-            if max_pages: image_paths = image_paths[:max_pages]
-            total_pages = len(image_paths)
-            if total_pages == 0:
-                ui_container.error(f"❌ {file.name} 提取失败！")
-                continue
-                
+            # ==============================================================
+            # 🚀 缓存未命中：在这里插入 Word/PPT 的分支，如果不符合则走你的原版 PDF 逻辑
+            # ==============================================================
             all_content = ""
-            progress_bar = ui_container.progress(0)
-            for i, path in enumerate(image_paths):
-                res = process_single_page(path, i + 1)
-                all_content += f"\n\n> 📁 **[来源文件：{base_name}]** - 第 {i+1} 页提取内容\n{res}\n"
-                progress_bar.progress((i + 1) / total_pages)
-            progress_bar.empty()
             
-            with open(cache_file_path, "w", encoding="utf-8") as f: f.write(all_content)
+            # --- 🔵 新增分支：Word 双擎提取 ---
+            if ext == '.docx':
+                ui_container.info(f"📝 正在深度解剖 Word 文档: {file.name}")
+                try:
+                    import docx
+                    import io
+                    doc = docx.Document(io.BytesIO(file_bytes))
+                    full_text = []
+                    
+                    for para in doc.paragraphs:
+                        if para.text.strip(): full_text.append(para.text)
+                    for table in doc.tables:
+                        for row in table.rows:
+                            full_text.append(" | ".join([cell.text.replace('\n', ' ') for cell in row.cells]))
+                    
+                    img_count = 0
+                    for rel in doc.part.rels.values():
+                        if "image" in rel.target_ref:
+                            img_bytes = rel.target_part.blob
+                            if len(img_bytes) > 15360: # 过滤 15KB 以下的 Logo
+                                img_count += 1
+                                ui_container.write(f"   🔍 发现有效 Word 插图 {img_count}，正在呼叫视觉引擎...")
+                                img_path = os.path.join(TEMP_IMG_DIR, f"word_{file_md5[:8]}_{img_count}.png")
+                                with open(img_path, "wb") as f: f.write(img_bytes)
+                                vis_res = process_single_page(img_path, f"Word核心插图_{img_count}")
+                                full_text.append(f"\n> 🖼️ **[文档插图/数据表 解析]**:\n{vis_res}\n")
+                                
+                    all_content = "\n".join(full_text)
+                    ui_container.success(f"✅ {file.name} 文本与图片双路解析完成！")
+                except ImportError:
+                    ui_container.error("❌ 缺少 docx 库，请执行 `pip install python-docx`")
+                    continue
+                    
+            # --- 🟠 新增分支：PPT 双擎提取 ---
+            elif ext == '.pptx':
+                ui_container.info(f"📊 正在逐页深度解剖 PPT: {file.name}")
+                try:
+                    from pptx import Presentation
+                    import io
+                    ppt = Presentation(io.BytesIO(file_bytes))
+                    full_text = []
+                    
+                    progress_bar = ui_container.progress(0)
+                    total_slides = len(ppt.slides)
+                    
+                    for i, slide in enumerate(ppt.slides):
+                        slide_text = []
+                        img_count = 0
+                        
+                        for shape in slide.shapes:
+                            if hasattr(shape, "text") and shape.text.strip():
+                                slide_text.append(shape.text.strip())
+                                
+                            if hasattr(shape, "image"):
+                                img_bytes = shape.image.blob
+                                if len(img_bytes) > 15360: # 过滤小图
+                                    img_count += 1
+                                    ui_container.write(f"   🔍 发现第 {i+1} 页核心插图，正在呼叫视觉引擎...")
+                                    img_path = os.path.join(TEMP_IMG_DIR, f"ppt_{file_md5[:8]}_s{i+1}_i{img_count}.png")
+                                    with open(img_path, "wb") as f: f.write(img_bytes)
+                                    vis_res = process_single_page(img_path, f"第{i+1}页_插图{img_count}")
+                                    slide_text.append(f"\n> 🖼️ **[本页核心插图/架构图 解析]**:\n{vis_res}\n")
+                                    
+                        full_text.append(f"\n--- 📑 第 {i+1} 页幻灯片 ---\n" + "\n".join(slide_text))
+                        progress_bar.progress((i + 1) / total_slides)
+                        
+                    progress_bar.empty()
+                    all_content = "\n".join(full_text)
+                    ui_container.success(f"✅ {file.name} PPT 图文全量提取完成！")
+                except ImportError:
+                    ui_container.error("❌ 缺少 pptx 库，请执行 `pip install python-pptx`")
+                    continue
+                    
+            # --- 🔴 你的原版兜底分支：PDF 及 图片提取 ---
+            else:
+                ui_container.warning(f"👁️ 正在激活视觉引擎，逐页提取新文件: {file.name} ...")
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                safe_filename = f"{timestamp}_{file.name}"
+                file_path = os.path.join(UPLOAD_DIR, safe_filename)
                 
-            try:
-                if os.path.exists(file_path): os.remove(file_path)
-                for img_path in image_paths:
-                    if os.path.exists(img_path): os.remove(img_path)
-                ui_container.success(f"✅ {file.name} 解析完成，已存入物理指纹缓存池！")
-            except Exception as e:
-                pass
+                with open(file_path, "wb") as f: f.write(file_bytes)
+                    
+                image_paths = []
+                if ext == '.pdf':
+                    from core.parsers.document_engine import convert_pdf_to_images
+                    image_paths.extend(convert_pdf_to_images(file_path, TEMP_IMG_DIR, max_pages))
+                else:
+                    image_paths.append(file_path)
+                    
+                if max_pages: image_paths = image_paths[:max_pages]
+                total_pages = len(image_paths)
+                if total_pages == 0:
+                    ui_container.error(f"❌ {file.name} 提取失败！")
+                    continue
+                    
+                progress_bar = ui_container.progress(0)
+                for i, path in enumerate(image_paths):
+                    res = process_single_page(path, i + 1)
+                    all_content += f"\n\n> 📁 **[来源文件：{base_name}]** - 第 {i+1} 页提取内容\n{res}\n"
+                    progress_bar.progress((i + 1) / total_pages)
+                progress_bar.empty()
                 
-            result_dict[base_name] = all_content
+                try:
+                    if os.path.exists(file_path): os.remove(file_path)
+                    for img_path in image_paths:
+                        if os.path.exists(img_path): os.remove(img_path)
+                    ui_container.success(f"✅ {file.name} 解析完成，已存入物理指纹缓存池！")
+                except Exception as e:
+                    pass
+
+            # ==============================================================
+            # 💾 你的原版缓存写入：无论是谁提取的 all_content，统一在此写入缓存并返回
+            # ==============================================================
+            if all_content:
+                with open(cache_file_path, "w", encoding="utf-8") as f: 
+                    f.write(all_content)
+                result_dict[base_name] = all_content
+                
     return result_dict
 
 tab1, tab2, tab3, tab4 = st.tabs([
@@ -178,7 +266,7 @@ tab1, tab2, tab3, tab4 = st.tabs([
 # ---------------------------------------------------------
 with tab1:
     st.markdown("###### 📥 上传待解读文档 (支持混传 PDF / JPG / MD)")
-    uploaded_files = st.file_uploader("请拖拽文件至此", type=["pdf", "png", "jpg", "jpeg", "md"], accept_multiple_files=True, key="tab1_uploader")
+    uploaded_files = st.file_uploader("请拖拽文件至此", type=["pdf", "png", "jpg", "jpeg", "md", "docx", "pptx"], accept_multiple_files=True, key="tab1_uploader")
     
     col_req, col_tpl = st.columns([2, 1])
     with col_req:
@@ -310,7 +398,7 @@ with tab2:
         options = ["🤖 AI 自动匹配金牌范例 (推荐)"] + get_available_templates()
         selected_strategy_b = st.selectbox("🎯 选择报告行文风格：", options, key="tab2_strategy")
 
-    compare_files = st.file_uploader("批量拖拽多个公司的文件至此", type=["pdf", "png", "jpg", "jpeg", "md"], accept_multiple_files=True, key="tab2_uploader")
+    compare_files = st.file_uploader("批量拖拽多个公司的文件至此", type=["pdf", "png", "jpg", "jpeg", "md", "docx", "pptx"], accept_multiple_files=True, key="tab2_uploader")
     
     if st.button("⚔️ 启动多 Agent 竞品横评", type="primary", key="btn_compare"):
         if not compare_files or len(compare_files) < 2:
@@ -376,7 +464,7 @@ with tab3:
         options = ["🤖 AI 自动匹配金牌范例 (推荐)"] + get_available_templates()
         selected_strategy_c = st.selectbox("🎯 选择报告行文风格：", options, key="tab3_strategy")
 
-    trend_files = st.file_uploader("批量拖拽多年的文件至此", type=["pdf", "png", "jpg", "jpeg", "md"], accept_multiple_files=True, key="tab3_uploader")
+    trend_files = st.file_uploader("批量拖拽多年的文件至此", type=["pdf", "png", "jpg", "jpeg", "md", "docx", "pptx"], accept_multiple_files=True, key="tab3_uploader")
     
     if st.button("📈 启动历史趋势推演", type="primary", key="btn_trend"):
         if not trend_files or len(trend_files) < 2:

@@ -8,7 +8,7 @@ os.environ["BROWSER"] = "chrome"
 st.set_page_config(page_title="AI 数据中台系统", page_icon="🗄️", layout="wide")
 
 # =========================================================
-# 🔴 核心修复：状态机全局初始化 (必须在渲染任何 UI 前执行)
+# 状态机全局初始化 (必须在渲染任何 UI 前执行)
 # =========================================================
 if "last_source_hash" not in st.session_state: st.session_state.last_source_hash = ""
 if "ai_advice_text" not in st.session_state: st.session_state.ai_advice_text = ""
@@ -19,17 +19,19 @@ if "pending_sql" not in st.session_state: st.session_state.pending_sql = ""
 if "pending_exp" not in st.session_state: st.session_state.pending_exp = ""
 if "business_dictionary" not in st.session_state: st.session_state.business_dictionary = ""
 
-# 引入重构后的核心 UI 模块
-from modules.data_steward.tabs_ui import (
-    render_etl_tab, render_profile_tab, render_join_tab, 
-    render_ai_chat_tab, render_manual_pivot_tab
-)
+# 引入重构后的核心 UI 模块（严格按照 1~6 顺序引入）
+from modules.data_steward.tabs.tab1_etl import render_etl_tab
+from modules.data_steward.tabs.tab2_profile import render_profile_tab
+from modules.data_steward.tabs.tab3_vlookup import render_join_tab
+from modules.data_steward.tabs.tab4_chat import render_ai_chat_tab
+from modules.data_steward.tabs.tab5_pivot import render_manual_pivot_tab
+from modules.data_steward.tabs.tab6_spatial import render_spatial_tab
 
 # =========================================================
-# 🟢 P3 演进：全局业务知识库 (Data Lineage & Jargon)
+# 全局业务知识库 (Data Lineage & Jargon)
 # =========================================================
 with st.sidebar:
-    st.markdown("### 🧠 企业级业务知识字典")
+    st.markdown("### 🧠 企业业务字典")
     st.info("💡 将术语定义、指标公式写在这里。AI 在对话和透视中会自动参考。")
     business_dict = st.text_area(
         "业务术语与常识记录：", 
@@ -45,18 +47,27 @@ with st.sidebar:
 # 页面顶级路由分发
 # =========================================================
 st.title("🗄️ 企业级 AI 数据中台")
-st.markdown("已升级架构：**并发隔离锁、OOM 阻断防御、SQL 安全拦截、以及业务知识大模型外挂**。")
 
-tab1, tab2, tab_join, tab_ai, tab_manual = st.tabs([
-    "📥 1. 数据入库装载引擎", 
-    "🗂️ 2. 资产大盘与画像", 
-    "🧩 3. 关联与拼接工厂", 
+# 严格按照 1 到 6 的命名顺序排列 Tab
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    "📥 1. 数据入库引擎", 
+    "🗂️ 2. 资产大盘", 
+    "🧩 3. 智能 VLOOKUP", 
     "💬 4. 连续分析推理台", 
-    "🖱️ 5. 智能透视工作台"
+    "🖱️ 5. 智能透视工作台",
+    "🗺️ 6. 空间与网格规划"
 ])
 
-with tab1: render_etl_tab()
-with tab2: render_profile_tab()
-with tab_join: render_join_tab()
-with tab_ai: render_ai_chat_tab()
-with tab_manual: render_manual_pivot_tab()
+# 依次挂载渲染函数
+with tab1:
+    render_etl_tab()
+with tab2:
+    render_profile_tab()
+with tab3:
+    render_join_tab()
+with tab4:
+    render_ai_chat_tab()
+with tab5:
+    render_manual_pivot_tab()
+with tab6:
+    render_spatial_tab()

@@ -6,6 +6,8 @@ import time
 from datetime import datetime
 from openai import OpenAI
 from modules.zclaw.web_tools import search_web, read_webpage
+from modules.zclaw.skill_tools import scan_skills
+
 
 import core.paths
 from core.settings import settings
